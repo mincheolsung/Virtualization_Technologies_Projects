@@ -1,0 +1,387 @@
+diff --git a/Makefile b/Makefile
+index 030ff4e..217e46c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ #
+ # Define WERROR=0 to disable -Werror.
+ #
+-
++WERROR=0
+ ifeq ($(strip $(V)),)
+ 	E = @echo
+ 	Q = @
+@@ -98,6 +98,8 @@ OBJS	+= kvm-ipc.o
+ OBJS	+= builtin-sandbox.o
+ OBJS	+= virtio/mmio.o
+ OBJS	+= hw/i8042.o
++OBJS	+= project2/project2_shmem.o
++OBJS	+= project2/project2_ipc.o
+ 
+ # Translate uname -m into ARCH string
+ ARCH ?= $(shell uname -m | sed -e s/i.86/i386/ -e s/ppc.*/powerpc/ \
+diff --git a/launch.sh b/launch.sh
+new file mode 100755
+index 0000000..2a48a13
+--- /dev/null
++++ b/launch.sh
+@@ -0,0 +1,2 @@
++#!/bin/sh
++sudo ./lkvm 0 run -d images/ubuntu.raw -m 3072 --network virtio --kernel kernel/bzImage -c 8 -p "root=/dev/vda2"
+diff --git a/launch2.sh b/launch2.sh
+new file mode 100755
+index 0000000..bd8aeca
+--- /dev/null
++++ b/launch2.sh
+@@ -0,0 +1,2 @@
++#!/bin/sh
++sudo ./lkvm 1 run -d images/ubuntu2.raw -m 3072 --network virtio --kernel kernel/bzImage -c 8 -p "root=/dev/vda2"
+diff --git a/main.c b/main.c
+index 05bc82c..0a9fdc4 100644
+--- a/main.c
++++ b/main.c
+@@ -1,3 +1,4 @@
++#include "main.h"
+ #include "kvm/kvm.h"
+ 
+ #include <stdlib.h>
+@@ -6,6 +7,8 @@
+ /* user defined header files */
+ #include <kvm/kvm-cmd.h>
+ 
++int ipc_id;
++
+ static int handle_kvm_command(int argc, char **argv)
+ {
+ 	return handle_command(kvm_commands, argc, (const char **) &argv[0]);
+@@ -14,6 +17,8 @@ static int handle_kvm_command(int argc, char **argv)
+ int main(int argc, char *argv[])
+ {
+ 	kvm__set_dir("%s/%s", HOME_DIR, KVM_PID_FILE_PATH);
++	
++	ipc_id = atoi(argv[1]);
+ 
+-	return handle_kvm_command(argc - 1, &argv[1]);
++	return handle_kvm_command(argc - 2, &argv[2]);
+ }
+diff --git a/main.h b/main.h
+new file mode 100644
+index 0000000..fe4e1d3
+--- /dev/null
++++ b/main.h
+@@ -0,0 +1,6 @@
++#ifndef __MAIN_H__
++#define __MAIN_H__
++
++extern int ipc_id;
++
++#endif
+diff --git a/project2/project2_ipc.c b/project2/project2_ipc.c
+new file mode 100644
+index 0000000..fdd990a
+--- /dev/null
++++ b/project2/project2_ipc.c
+@@ -0,0 +1,64 @@
++#include "project2_ipc.h"
++#include "../main.h"
++
++#include <sys/ipc.h>
++#include <sys/shm.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <string.h>
++#include <signal.h>
++#include <stdlib.h>
++
++#include "kvm/irq.h"
++#include "kvm/kvm.h"
++
++int shmid[2];
++char *read_str, *write_str;
++
++static void sigusr1(int signo)
++{
++	/* send interrupt to the guest */
++	kvm__irq_trigger(project2_kvm, irq_line);	
++
++	return; 
++}
++
++int ipc_init(void)
++{
++	/*signal stuffs*/
++	struct sigaction act;
++	sigset_t block_mask;
++	sigfillset(&block_mask);
++	act.sa_handler = sigusr1;
++	act.sa_mask = block_mask;
++	act.sa_flags = 0;
++
++	if (sigaction(SIGUSR1, &act, NULL) != 0)
++	{
++	       	//printf("Signal Action Failed\n");
++		return 0;
++	}
++
++	/* shared memory stuff */
++	const char *pathname[] = {"shmfile", "shmfile2"};
++	int proj_id[] = {65, 606};
++	int dest_PID;
++
++	// ftok to generate unique key
++	key_t key[2];
++	key[0] = ftok(pathname[0], proj_id[0]);
++	key[1] = ftok(pathname[1], proj_id[1]);
++
++	// shmget returns an identifier in shmid
++	shmid[0] = shmget(key[0], 1024, 0666|IPC_CREAT);
++	shmid[1] = shmget(key[1], 1024, 0666|IPC_CREAT);
++
++	// shmat to attach to shared memory
++	char *write_str = (char*) shmat(shmid[ipc_id], (void*)0,0);
++	sprintf(write_str, "%d", (int)getpid());  
++
++	read_str = (char*) shmat(shmid[ipc_id?0:1], (void*)0,0);
++	
++	return dest_PID;
++}
+diff --git a/project2/project2_ipc.h b/project2/project2_ipc.h
+new file mode 100644
+index 0000000..250a86f
+--- /dev/null
++++ b/project2/project2_ipc.h
+@@ -0,0 +1,12 @@
++#ifndef __PROJECT2_IPC_H__
++#define __PROJECT2_IPC_H__
++
++extern struct kvm *project2_kvm;
++extern int irq_line;
++
++extern char *write_str, *read_str;
++extern int shmid[2];
++
++int ipc_init(void);
++
++#endif
+diff --git a/project2/project2_shmem.c b/project2/project2_shmem.c
+new file mode 100644
+index 0000000..afa9125
+--- /dev/null
++++ b/project2/project2_shmem.c
+@@ -0,0 +1,209 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <linux/kvm.h>
++#include <linux/types.h>
++#include <linux/list.h>
++#include <sys/ipc.h>
++#include <sys/shm.h>
++
++#include "kvm/irq.h"
++#include "kvm/util.h"
++#include "kvm/kvm.h"
++#include "kvm/ioport.h"
++#include "../main.h"
++#include "project2_ipc.h"
++
++#define MB_SHIFT 20
++#define KB_SHIFT 10
++#define SHMEM_DEFAULT_SIZE (128 << MB_SHIFT)
++#define SHMEM_DEFAULT_ADDR (0xc1000000)
++#define SHMEM_DEFAULT_HANDLE "/kvm_shmem"
++
++#define PROJECT2_SHMEM_ADDR_IN (u16)0x700
++#define PROJECT2_IRQ_LINE_IN (u16)0x800
++
++#define PROJECT2_INTERRUPT_DOWN 0
++#define PROJECT2_INTERRUPT_UP	1
++
++struct shmem_info {
++	u64 phys_addr;
++	u64 size;
++	char *handle;
++	int create;
++};
++
++static struct shmem_info *shmem_region;
++
++static void *mem;
++static u64 guest_addr;
++static u32 guest_addr_lower;
++struct kvm *project2_kvm;
++int irq_line;
++int dest_PID;
++
++static int setup_shmem_region(void)
++{
++	/* create shared memory region */
++	shmem_region = (struct shmem_info *)malloc(sizeof(struct shmem_info));
++	if (!shmem_region)
++		return -ENOMEM;
++
++	/* init shmem region */
++	shmem_region->phys_addr = SHMEM_DEFAULT_ADDR;
++	shmem_region->size = SHMEM_DEFAULT_SIZE;
++	shmem_region->handle = (char *)malloc(strlen(SHMEM_DEFAULT_HANDLE));
++	if (!shmem_region->handle)
++		return -ENOMEM;	
++	strcpy(shmem_region->handle, SHMEM_DEFAULT_HANDLE);
++
++	/* create fd of shm if not exists? */
++	shmem_region->create = 1;
++
++	return 0;
++}
++
++static void *setup_shmem(const char *key, size_t len, int creating)
++{
++	int fd;
++	int rtn;
++	void *mem;
++	int flag = O_RDWR;
++
++	/* if not exists, create */
++	if (creating)
++		flag |= O_CREAT;
++
++	/* open shm file */
++	fd = shm_open(key, flag, S_IRWXU | S_IRWXG | S_IRWXO);
++	if (fd < 0) {
++		pr_warning("Failed to open shared memory file %s\n", key);
++		return NULL;
++	}
++
++	if (creating) {
++		rtn = ftruncate(fd, (off_t) len);
++		if (rtn < 0)
++			pr_warning("Can't ftruncate(fd,%zu)\n", len);
++	}
++
++	/* map shared memory file to mem */
++	mem = mmap(NULL, len,
++		   PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd, 0);
++	if (mem == MAP_FAILED) {
++		pr_warning("Failed to mmap shared memory file");
++		mem = NULL;
++	}
++	close(fd);
++
++	return mem;
++}
++
++
++static bool project2_io_in(struct ioport *ioport, struct kvm_cpu *vcpu, u16 port, void *data, int size)
++{
++	/* pass the guest physical address of the shared memory to the guest */
++	if (port == PROJECT2_SHMEM_ADDR_IN)
++		ioport__write32(data, (unsigned int)guest_addr_lower);
++
++	/* pass the irq line to the guest */
++	else if (port == PROJECT2_IRQ_LINE_IN)
++		ioport__write32(data, (unsigned int)irq_line);
++	
++	return true;
++}
++
++static bool project2_io_out(struct ioport *ioport, struct kvm_cpu *vcpu, u16 port, void *data, int size)
++{
++	unsigned int irq;
++	
++	irq = ioport__read32(data);
++
++	/* guest sends interrupt down to the kvmtool */
++	if (irq == PROJECT2_INTERRUPT_DOWN)
++	{
++		dest_PID = atoi(read_str);
++		/* send signal to other kvmtool (notification) */
++		if (kill(dest_PID, SIGUSR1) != 0)
++			pr_warning("Failed to send signal %d to %d\n", SIGUSR1, atoi(read_str));
++	}
++
++	/* dummy for debugging */
++	else if (irq == PROJECT2_INTERRUPT_UP)
++	{
++		kvm__irq_trigger(project2_kvm, irq_line);
++	}
++
++	return true;
++}
++
++static struct ioport_operations project2_ioport_op = {
++	.io_in = project2_io_in,
++	.io_out = project2_io_out,
++};
++
++static int project2_init(struct kvm *kvm)
++{
++	int r;
++	int ret = 0;
++
++	/* store struct kvm for further usage */	
++	project2_kvm = kvm;
++
++	/* register io port */	
++	r = ioport__register(kvm, 0x700, &project2_ioport_op, IOPORT_SIZE, NULL);
++	if (r < 0)
++	{
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* create shared memory region */
++	if (setup_shmem_region())
++	{
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/* open shared memory and plug it into the guest */
++	mem = setup_shmem(shmem_region->handle, shmem_region->size, shmem_region->create);
++	if (mem == NULL)
++	{
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/* flush the shared memory */
++	memset(mem, 0, SHMEM_DEFAULT_SIZE);
++
++	/* register the shared memory to kvm */
++	kvm__register_mem(kvm, shmem_region->phys_addr, shmem_region->size, mem);
++	/* translate host virtual address to guest physical address */
++	guest_addr = host_to_guest_flat(kvm, mem);
++	/* since io ports are 32bit, extract lower 32bit part from the guest physical address */
++	guest_addr_lower = guest_addr & 0xFFFFFFFF;
++
++	/* init irq */
++	/* get uniq irq line */
++	irq_line = irq__alloc_line();
++	/* regiter the irq line */
++	kvm__irq_line(kvm, irq_line, 0);
++
++	/* get other kvmtool's pid (target pid for sending signal) */
++	dest_PID = ipc_init();
++
++out:
++	return ret;
++}
++dev_base_init(project2_init);
++
++static int project2_exit(struct kvm *kvm)
++{
++	/* destroy the shared memory */
++	shmctl(shmid[ipc_id?0:1], IPC_RMID, NULL);
++		     
++	/* detach from shared memory */
++	shmdt(write_str);
++	shmdt(read_str);
++	return 0;
++}
++dev_base_exit(project2_exit);
+diff --git a/shmfile b/shmfile
+new file mode 100644
+index 0000000..e69de29
+diff --git a/shmfile2 b/shmfile2
+new file mode 100644
+index 0000000..e69de29

@@ -1,0 +1,82 @@
+Building instructions
+
+For buillding HermitCore and newlib we assume that all the corresponding prerequisite packages,
+including HermitCore Toolchain, Cmake, and so one are installed are described in provided 
+Helper Guide for this project. Then set the environment variable if not done so far as follows.
+
+$ export PATH=$PATH:/opt/hermit/bin
+
+Our submission comes with two patches: one for HermitCore modifications and another for newlib modifications. 
+Download HermitCore, apply patches, compile and install as shown below.
+
+$ git clone https://github.com/RWTH-OS/HermitCore.git hermit
+$ cd hermit
+$ git submodule init
+$ git submodule update
+$ git apply HermitCore.patch
+$ mkdir build
+$ cd build
+$ cmake ..
+$ make -j `nproc` && sudo make install
+(Comment: there are trailing white line warning during applying the patch. We couldn’t fix the warning due to time limitation.)
+
+Download newlib, apply patches, compile and install as shown below.
+
+$ git clone https://github.com/olivierpierre/newlib.git
+$ cd newlib
+$ git apply newlib.patch
+$ ./configure --target=x86_64-hermit --prefix=/opt/hermit --disable-shared --disable-multilib --enable-lto --enable-newlib-hw-fp --enable-newlib-io-c99-formats --enable-newlib-multithreaded
+$ make -j `nproc`
+$ sudo PATH=$PATH:/opt/hermit/bin make install
+
+For this project we ran two benchmark, postmark and latency_test, which is describe in Experimental Description section in detail.
+Sources for these benchmarks should be available in hermit/usr/tests directory.  You can compile and run with make.
+
+$ cd HermitCore/usr/tests/
+$ make postmark
+
+Then it prompts you to set configuration for postmark. If you want to run with default configuration, then just type “run”.
+
+PostMark v1.5 : 3/27/01
+pm> run
+
+Similarly we can build and run our micro benchmark for latency measurement called latency_test.
+
+$ make latency_test
+
+It prompts you to set number of iteration, for example iteration 10,
+
+Latency Test for
+10
+
+
+
+Files added or edited
+
+HermitCore/CMakeLists.txt
+HermitCore/fs/*.c
+HermitCore/fs/misc.h
+HermitCore/include/hermit/hfs.h
+HermitCore/include/hermit/hfs_struct.h
+HermitCore/include/hermit/ramdisk.h
+HermitCore/include/hermit/syscall.h
+HermitCore/kernel/syscall.c
+HermitCore/kernel/main.c
+HermitCore/tools/proxy.c
+HermitCore/usr/tests/Makefile
+HermitCore/usr/tests/latency_test.c
+HermitCore/usr/tests/latency_test_linux.c
+HermitCore/usr/tests/postmark-1_5.c
+HermitCore/usr/tests/prog.c
+
+newlib/newlib/libc/include/getcwd.h
+newlib/newlib/libc/include/ls.h
+newlib/newlib/libc/include/mkdir.h
+newlib/newlib/libc/include/rmdir.h
+newlib/newlib/libc/sys/hermit/Makefile.am
+newlib/newlib/libc/sys/hermit/Makefile.in
+newlib/newlib/libc/sys/hermit/getcwd.c
+newlib/newlib/libc/sys/hermit/ls.c
+newlib/newlib/libc/sys/hermit/mkdir.c
+newlib/newlib/libc/sys/hermit/rmdir.c
+newlib/newlib/libc/sys/hermit/unlink.c

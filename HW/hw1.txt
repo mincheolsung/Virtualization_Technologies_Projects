@@ -1,0 +1,16 @@
+Mincheol
+
+Where is the instruction in the source code?
+	-arch/x86/include/asm/kvm/kvm_para.h:21
+
+Why has it been put there?
+	-kvm_hypercalls are there
+
+Use grep, git log [-p], kernel mailing list, etc
+	-https://www.systutorials.com/linux-kernels/38981/x86-kvm-use-alternatives-for-vmcall-vs-vmmcall-if-kernel-text-is-read-only-linux-3-2-66/
+
+When loading the KVM kernel modules, which function is first called?
+	-vmx_init -> kvm_init
+
+AMD users: what instructions can be used to start a VM?
+	-vmmcall

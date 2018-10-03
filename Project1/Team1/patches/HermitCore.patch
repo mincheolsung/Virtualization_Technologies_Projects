@@ -1,0 +1,5191 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2e566e4..b4f55bd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,7 @@ add_subdirectory(include/hermit)
+ add_kernel_module_sources("kernel"		"kernel/*.c")
+ add_kernel_module_sources("libkern"		"libkern/*.c")
+ add_kernel_module_sources("mm"			"mm/*.c")
++add_kernel_module_sources("fs"			"fs/*.c")
+ add_kernel_module_sources("drivers"		"drivers/net/*.c")
+ 
+ set(LWIP_SRC lwip/src)
+diff --git a/fs/hfs.c b/fs/hfs.c
+new file mode 100644
+index 0000000..73e122a
+--- /dev/null
++++ b/fs/hfs.c
+@@ -0,0 +1,117 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++struct file_desc **file_desc_table = NULL;
++struct free_file_desc_id *ffdid = NULL;
++
++int hfs_mkfs(int new)
++{
++	int i;
++	struct free_block *curr_block;
++	struct free_block_desc_id *curr_id;
++
++	if(new)
++	{
++		ramdisk->root.dir_table = kmalloc(sizeof(struct file_desc)*NO_OF_BLOCKS);
++		if (!ramdisk->root.dir_table)
++		{
++			LOG_ERROR("failed to create root dir\n");
++			return -ENOMEM;
++		}
++
++		strcpy(ramdisk->root.dir_table[0].name, "/");
++		ramdisk->root.dir_table[0].is_dir = 1;
++		ramdisk->root.dir_table[0].size = sizeof(struct file_desc)+sizeof(struct dir_desc);
++		ramdisk->root.dir_table[0].mode = 755;
++		ramdisk->root.dir_table[0].status = s_free;
++		ramdisk->root.dir_table[0].dir = kmalloc(sizeof(struct dir_desc));
++		if (!ramdisk->root.dir_table[0].dir)
++		{
++			LOG_ERROR("mkfs: dir failed\n");
++			return -ENOMEM;
++		}
++
++		ramdisk->root.dir_table[0].fat_index = 0;
++		ramdisk->root.num_files = 1;
++		
++		ramdisk->fat = kmalloc(sizeof(struct fat_entry) * NO_OF_BLOCKS);
++		if (!ramdisk->fat)
++		{
++			LOG_ERROR("FAT init failed\n");
++			return -ENOMEM;
++		}
++		/* FAT's first entry is reserved */
++		ramdisk->fat[0].valid = 0;
++		ramdisk->fat[0].block_index = 0;
++		ramdisk->fat[0].next_index = 0;
++
++		/* First FAT entry and first block are reserved */
++		for (i = 1; i < NO_OF_BLOCKS; i++)
++		{
++			(ramdisk->fat)[i].valid = 1;
++			(ramdisk->fat)[i].block_index = 0;
++			(ramdisk->fat)[i].next_index = 0;
++		}
++			
++		
++		/* first block */
++		ramdisk->free_block_list = kmalloc(sizeof(struct free_block));
++		if (!ramdisk->free_block_list)
++		{
++			LOG_ERROR("mkfs: ramdisk->free_block_list failed\n");
++			return -ENOMEM;
++		}
++		ramdisk->free_block_list->block_index = 1;
++		ramdisk->free_block_list->next_free_block = ramdisk->free_block_list;
++
++		/* Next blocks */
++		curr_block = ramdisk->free_block_list;
++		for (i = 2; i < NO_OF_BLOCKS; i++)
++			curr_block = add_free_block(curr_block, i);
++
++		ramdisk->free_block_list = curr_block;
++
++		/*Initialize all file descriptor ID to NULL -> all files are closed*/
++		file_desc_table = kmalloc(sizeof(struct file_desc *) * NO_OF_BLOCKS);
++		if (!file_desc_table)
++		{
++			LOG_ERROR("mkfs: file_desc_table failed\n");
++			return -ENOMEM;
++		}
++
++		for (i = 0; i < NO_OF_BLOCKS; i++)
++			file_desc_table[i] = NULL;
++
++		/*Initialize free file descriptor ID pool (circular linked list)*/
++		ffdid = kmalloc(sizeof(struct free_file_desc_id));
++		if (!ffdid)
++		{
++			LOG_ERROR("mkfs: ffdid failed\n");
++			return -ENOMEM;
++		}
++		ffdid->id = 3;
++		ffdid->next_free_file_desc_id = ffdid;
++		curr_id = ffdid;
++
++		/* fd 0, 1, 2 reserved */
++		for (i = 4; i < NO_OF_BLOCKS + 2; i++)
++			curr_id = add_free_id(curr_id, i);
++			
++		ffdid = curr_id;
++
++		return 0;	
++	}
++	else
++	{
++		return 0;	
++	}
++}
++
+diff --git a/fs/hfs_close.c b/fs/hfs_close.c
+new file mode 100644
+index 0000000..4493c51
+--- /dev/null
++++ b/fs/hfs_close.c
+@@ -0,0 +1,29 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++int hfs_close(int fd)
++{
++	struct file_desc *file;
++
++	file = get_file(fd);
++	if (!file)
++	{
++		LOG_ERROR("file not opened\n");
++		return -1;
++	}
++	file->status = s_close;
++	file_desc_table[fd] = NULL;
++	ffdid = add_free_id(ffdid, fd);
++
++	return 0;
++}
++
++
+diff --git a/fs/hfs_ls.c b/fs/hfs_ls.c
+new file mode 100644
+index 0000000..d0c3443
+--- /dev/null
++++ b/fs/hfs_ls.c
+@@ -0,0 +1,41 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++char *hfs_ls(const char *path)
++{
++	char file_name[100];
++	struct dir_desc *dir;
++	unsigned int i;
++
++	LOG_INFO("ls %s\n", path);
++	
++	if(hfs_strrchr(path, '/'))
++		strcpy(file_name, hfs_strrchr(path, '/')+1);
++	else
++		strcpy(file_name, path);
++	
++	dir = fetch_dir(path);
++	if(!dir)
++	{	
++		LOG_ERROR("fetch_dir failed\n");	
++		return NULL;	
++	}
++	
++	for (i = 0; i < NO_OF_BLOCKS; i++)
++	{
++		if(dir->dir_table[i].status != s_free)
++			LOG_INFO("%s\n", dir->dir_table[i].name);	
++	}		
++	
++	//hfs_print_fat();
++	
++	return NULL;
++}
+diff --git a/fs/hfs_lseek.c b/fs/hfs_lseek.c
+new file mode 100644
+index 0000000..485bdc9
+--- /dev/null
++++ b/fs/hfs_lseek.c
+@@ -0,0 +1,36 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++
++#include <hermit/ramdisk.h>
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++long long hfs_lseek(int fd, long long offset, int whence)
++{
++	struct file_desc *file;
++	
++	file = get_file(fd);
++	if (!file)
++	{
++		LOG_ERROR("file not opened\n");
++		return -1;
++	}
++
++	if (whence == SEEK_SET)
++		file->offset = offset;
++
++	else if (whence == SEEK_CUR)
++		file->offset += offset;
++
++	else if (whence == SEEK_END)
++		file->offset = (long long)file->size + offset;
++	
++	else
++		LOG_ERROR("lseek: unsupported whence\n");
++
++	return file->offset;
++}
+diff --git a/fs/hfs_mkdir.c b/fs/hfs_mkdir.c
+new file mode 100644
+index 0000000..fd3df13
+--- /dev/null
++++ b/fs/hfs_mkdir.c
+@@ -0,0 +1,59 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++
++#include <hermit/ramdisk.h>
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++int hfs_mkdir(const char* path, unsigned int mode)
++{
++	char file_name[100];
++	struct dir_desc *dir;
++	struct dir_desc *new_dir;
++	unsigned int index;
++	new_dir = kmalloc(sizeof(struct dir_desc));
++	if (!new_dir)
++		return -1;
++
++	if(hfs_strrchr(path, '/'))
++		strcpy(file_name, hfs_strrchr(path, '/')+1);
++	else
++		strcpy(file_name, path);
++
++	dir = fetch_dir(path);
++	if( has_file(dir,file_name) )
++	{	
++		LOG_ERROR("fetch_dir failed\n");	
++		return -1;	
++	}
++
++	index = hfs_get_free_dir_index(dir);
++	strcpy(dir->dir_table[index].name, file_name);
++	dir->dir_table[index].is_dir = 1;
++	dir->dir_table[index].size = sizeof(struct file_desc)+sizeof(struct  dir_desc);
++	dir->dir_table[index].mode = mode;
++	dir->dir_table[index].status = s_close;
++	
++	new_dir->dir_table = kmalloc(sizeof(struct file_desc)* NO_OF_BLOCKS);
++	if(!new_dir->dir_table)
++	{
++		LOG_ERROR("new dir_table creation failed\n");
++		return -1;
++	}
++
++	strcpy(new_dir->dir_table[0].name, ".");
++	new_dir->dir_table[0].is_dir = 1;
++	new_dir->dir_table[0].size = sizeof(struct file_desc)+sizeof(struct  dir_desc);
++	new_dir->dir_table[0].mode = mode;
++	new_dir->dir_table[0].status = s_close;
++	dir->dir_table[index].dir = new_dir;
++	new_dir->num_files = 1;
++	dir->num_files++;
++	
++	LOG_INFO("mkdir %s done\n", path);
++	return 0;
++}
+diff --git a/fs/hfs_open.c b/fs/hfs_open.c
+new file mode 100644
+index 0000000..643878b
+--- /dev/null
++++ b/fs/hfs_open.c
+@@ -0,0 +1,113 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++int hfs_open(const char *path, unsigned int flags, unsigned int mode)
++{
++	int fd = 0;
++	char file_name[100];
++	struct dir_desc *dir;
++	unsigned int index = 0;
++	unsigned long long fat_index = 0;
++	unsigned long long block_index = 0;
++
++	LOG_INFO("hfs_open: %s, flags:%x, mode:%d\n", path, flags,mode);
++	if(hfs_strrchr(path, '/'))
++		strcpy(file_name, hfs_strrchr(path, '/')+1);
++	else
++		strcpy(file_name, path);
++
++	dir = fetch_dir(path);
++	
++	if (flags & O_CREAT)
++	{
++		if( has_file(dir,file_name) )
++		{	
++			LOG_ERROR("%s already exists\n", path);
++			goto out;
++		}
++
++		//LOG_INFO("hfs_open: create %s, flags:%x\n", path, flags);
++		
++		index = hfs_get_free_dir_index(dir);
++		strcpy(dir->dir_table[index].name, file_name);
++		dir->dir_table[index].is_dir = 0; /* it is not a directory */
++		dir->dir_table[index].size = 0;
++		dir->dir_table[index].flags = flags;
++		dir->dir_table[index].mode = mode;
++		dir->dir_table[index].status = s_open;
++		dir->dir_table[index].dir = NULL; /* it is not a directory */
++		dir->dir_table[index].offset = 0;
++
++		/* FAT index allocated */
++		fat_index = hfs_get_free_fat_index(ramdisk->fat);
++		dir->dir_table[index].fat_index = fat_index;
++
++		if (fat_index == 0)
++		{
++			LOG_ERROR("fat index: %llu\n",dir->dir_table[index].fat_index);
++			return -ENOMEM;
++		}
++		//LOG_INFO("FAT: %ld allcoated to %s\n", fat_index, path);
++
++		/* Block index allocated */
++		/* XXX need check there is no free block left */
++		block_index = pop_free_block(ramdisk->free_block_list);
++		//LOG_INFO("Block %lld allocated to %s\n", block_index, path);
++
++		/* FAT configured */
++		ramdisk->fat[fat_index].valid = 0; 
++		ramdisk->fat[fat_index].block_index  = block_index;
++		ramdisk->fat[fat_index].next_index   = 0;
++
++		/* fd table configured */
++		fd = pop_free_id(ffdid);
++		if (fd < 3)
++		{
++			LOG_ERROR("fd < 3, fd:%d\n",fd);
++			return -1;
++		}
++		//dir->dir_table[index].id = fd;
++		file_desc_table[fd] = &(dir->dir_table[index]);
++
++		/* really file created */
++		dir->num_files++;
++
++		return fd;
++	}	
++	
++	//else if ((flags & O_RDONLY) || (flags & O_RDWR) || (flags & O_APPEND))
++	
++out:
++	index = has_file(dir, file_name);
++	if (index == 0)
++	{	
++		LOG_ERROR("%s not exists\n", path);	
++		return -1;	
++	}
++
++	//LOG_INFO("hfs_open: else %s, flags:%x\n", path, flags);
++	//LOG_INFO("hfs_open %s, flags: %x\n", dir->dir_table[index].name, flags);
++	dir->dir_table[index].status = s_open;
++	dir->dir_table[index].flags = flags;
++	dir->dir_table[index].offset = 0;
++	fd = pop_free_id(ffdid);
++	if (fd < 3)
++	{
++		LOG_ERROR("fd < 3, fd:%d\n",fd);
++		return -1;
++	}
++	//dir->dir_table[index].id = fd;
++	file_desc_table[fd] = &(dir->dir_table[index]);
++
++	//LOG_INFO("hfs_open ends, fd=%d\n",fd);
++	return fd;
++}
++
++
+diff --git a/fs/hfs_read.c b/fs/hfs_read.c
+new file mode 100644
+index 0000000..a62e897
+--- /dev/null
++++ b/fs/hfs_read.c
+@@ -0,0 +1,76 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++size_t hfs_read(int fd, void* buffer, size_t count)
++{
++	unsigned long long block_index, next_index, fat_index;
++	size_t remaining_offset, remaining_count = count, read_count = 0;
++	size_t size;
++	size_t src;
++	struct file_desc *file;
++
++	file = get_file(fd);
++	if (!file)
++	{
++		LOG_ERROR("file not opened\n");
++		return -1;
++	}
++	//LOG_INFO("hfs_read %s\n",file->name);
++
++	fat_index = file->fat_index;
++	block_index = ramdisk->fat[fat_index].block_index;
++	next_index  = ramdisk->fat[fat_index].next_index;	
++	remaining_offset = file->offset;
++	while (remaining_offset > BLOCK_SIZE)
++	{
++		//LOG_INFO("hfs_read: FAT walk through\n");
++		remaining_offset = remaining_offset - BLOCK_SIZE;
++		block_index = ramdisk->fat[next_index].block_index;
++		next_index  = ramdisk->fat[next_index].next_index;
++	}
++
++	if (count <= BLOCK_SIZE - remaining_offset)
++	{
++		memcpy(buffer, ramdisk->data_block + (block_index * BLOCK_SIZE) + remaining_offset, count);
++		read_count = count;
++	}
++	else
++	{
++		size = BLOCK_SIZE - remaining_offset; 
++		src = ramdisk->data_block + (block_index * BLOCK_SIZE) + remaining_offset;
++
++		while (remaining_count > 0)
++		{
++			if (remaining_count < BLOCK_SIZE)
++				size = remaining_count;
++
++			memcpy(buffer + read_count, src, size);
++			read_count += size;
++
++			remaining_count -= size;
++			if (!remaining_count)
++				break;
++
++			if (remaining_count > BLOCK_SIZE)
++				size = BLOCK_SIZE;
++			
++			/* end of the file */
++			if (next_index == 0)
++				break;
++
++			block_index = ramdisk->fat[next_index].block_index;
++			next_index = ramdisk->fat[next_index].next_index;
++			src = ramdisk->data_block + (block_index * BLOCK_SIZE);
++		}
++	}
++	//LOG_INFO("hfs_read %s ends, read: %llu\n",file->name, read_count);
++	return read_count; 
++}
+diff --git a/fs/hfs_rmdir.c b/fs/hfs_rmdir.c
+new file mode 100644
+index 0000000..58b6b23
+--- /dev/null
++++ b/fs/hfs_rmdir.c
+@@ -0,0 +1,71 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++int hfs_rmdir(const char * path)
++{	
++	unsigned int i;
++	char file_name[100] = "";
++	unsigned int index = 0;
++	struct dir_desc *dir;
++	struct file_desc *file;
++
++	if(hfs_strrchr(path, '/'))
++		strcpy(file_name, hfs_strrchr(path, '/')+1);
++	else
++		strcpy(file_name, path);
++
++	dir = fetch_dir(path);
++	if(!dir)
++	{
++		LOG_ERROR("rmdir: fetch_dir failed\n");
++		return -1;
++	}
++
++	index = has_file(dir, file_name);
++	if(index == 0)
++	{	
++		LOG_ERROR("%s not exists\n", path);	
++		return -1;	
++	}
++
++	file = &(dir->dir_table[index]);
++	LOG_INFO("rmdir %s\n", path);
++	
++	if (file->is_dir != 1)
++	{
++		LOG_ERROR("%s is not a directory\n", file->name);
++		return -1;
++	}
++	
++	if (file->dir->num_files > 1)
++	{
++		LOG_ERROR("%s is not an empty directory\n", file->name);
++		return -1;
++	}
++	else
++	{	
++		strncpy(file->name,"",100);
++		file->is_dir = 0;
++		file->offset = 0;
++		file->size = 0;
++		file->mode = 0;
++		file->flags = 0;
++		file->status = s_free;
++		kfree(file->dir->dir_table);
++		kfree(file->dir);
++		file->dir = NULL;
++		dir->num_files--;
++	}
++
++	return 0;
++}
++
++
+diff --git a/fs/hfs_unlink.c b/fs/hfs_unlink.c
+new file mode 100644
+index 0000000..7d35679
+--- /dev/null
++++ b/fs/hfs_unlink.c
+@@ -0,0 +1,72 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++int hfs_unlink(const char * path)
++{	
++	int i;
++	char file_name[100] = "";
++	unsigned int index = 0;
++	struct dir_desc *dir;
++	struct file_desc *file;
++	unsigned long long fat_index, block_index, next_index;
++
++	if(hfs_strrchr(path, '/'))
++		strcpy(file_name, hfs_strrchr(path, '/')+1);
++	else
++		strcpy(file_name, path);
++
++	dir = fetch_dir(path);
++
++	index = has_file(dir, file_name);
++	if(index == 0)
++	{	
++		LOG_ERROR("%s not exists\n", path);	
++		return -1;	
++	}
++
++	file = &(dir->dir_table[index]);
++	LOG_INFO("unlink %s\n", file->name);
++	
++	if (file->is_dir == 1)
++	{
++		LOG_ERROR("%s is a directory\n", file->name);
++		return -1;
++	}
++
++	else
++	{
++		/* FAT reset */
++		fat_index = file->fat_index;
++		ramdisk->fat[fat_index].valid = 1;
++		/* block return to free block list */
++		block_index = ramdisk->fat[fat_index].block_index;
++		next_index  = ramdisk->fat[fat_index].next_index;
++		while(1)
++		{
++			/* add block into free block list */
++			add_free_block(ramdisk->free_block_list, block_index);
++		
++			/* the last block */	
++			if (next_index == 0)
++				break;	
++	
++			block_index = ramdisk->fat[next_index].block_index;
++			next_index  = ramdisk->fat[next_index].next_index;
++		}
++
++		file->status = s_free;
++		dir->num_files--;
++	}
++
++	return 0;
++}
++
++
+diff --git a/fs/hfs_write.c b/fs/hfs_write.c
+new file mode 100644
+index 0000000..586074c
+--- /dev/null
++++ b/fs/hfs_write.c
+@@ -0,0 +1,104 @@
++#include <hermit/stdlib.h>
++#include <hermit/string.h>
++#include <hermit/stdio.h>
++#include <hermit/logging.h>
++#include <hermit/errno.h>
++#include <hermit/ramdisk.h>
++
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++size_t hfs_write(int fd, const void* buffer, size_t count)
++{
++	unsigned long long block_index, next_index, current_index, fat_index;
++	size_t remaining_offset = 0, remaining_count = count, written_count = 0;
++	size_t size;
++	size_t dst;
++	struct file_desc *file;	
++	unsigned int num_block = 0;
++
++	file = get_file(fd);
++	if (!file)
++	{
++		LOG_ERROR("file not opened\n");
++		return -1;
++	}
++	//LOG_INFO("hfs_write %s\n", file->name);
++	
++	fat_index = file->fat_index;
++	block_index = ramdisk->fat[fat_index].block_index;
++	current_index = fat_index;
++	next_index  = ramdisk->fat[fat_index].next_index;
++
++	if (file->flags & O_APPEND)
++	{
++		remaining_offset = file->size;
++	}
++	remaining_offset += file->offset;
++	
++	while (remaining_offset > BLOCK_SIZE)
++	{
++		//LOG_INFO("hfs_write: FAT walk through\n");
++		remaining_offset = remaining_offset - BLOCK_SIZE;
++		block_index = ramdisk->fat[next_index].block_index;
++		current_index = next_index;
++		next_index  = ramdisk->fat[next_index].next_index;
++	}
++
++	if (count <= BLOCK_SIZE - remaining_offset)
++	{
++		memcpy(ramdisk->data_block + (block_index * BLOCK_SIZE) + remaining_offset, buffer, count);
++		written_count = count;
++		num_block++;
++	}
++	else
++	{
++		size = BLOCK_SIZE - remaining_offset; //write rest of the block
++		dst = ramdisk->data_block + (block_index * BLOCK_SIZE) + remaining_offset;
++
++		while (remaining_count > 0)
++		{
++			num_block++;
++			memcpy(dst, buffer + written_count, size);
++			written_count += size;
++
++			remaining_count -= size;
++			if (!remaining_count)
++				break;
++			if (remaining_count > BLOCK_SIZE)
++				size = BLOCK_SIZE;
++			else
++				size = remaining_count;
++				
++			next_index = hfs_get_free_fat_index(ramdisk->fat);
++			/* fine next block to be written  */
++			block_index = pop_free_block(ramdisk->free_block_list);
++			if (next_index <= 0)
++			{
++				LOG_ERROR("next block index <= 0, %llu", next_index);
++				return -1;
++			}
++			
++			/* fill the current FAT entry */
++			ramdisk->fat[current_index].next_index = next_index;
++			
++			/* fill the next FAT entry */
++			ramdisk->fat[next_index].valid = 0;
++			ramdisk->fat[next_index].block_index = block_index;
++			ramdisk->fat[next_index].next_index  = 0;
++			
++			current_index = next_index;
++			dst = ramdisk->data_block + (block_index * BLOCK_SIZE);
++		}
++	}
++	
++	if (file->flags & O_APPEND)
++		file->size += BLOCK_SIZE * num_block;
++	else
++		file->size = BLOCK_SIZE * num_block;
++
++	//hfs_print_fat();
++	//LOG_INFO("write %s ends, write %llu\n", file->name, written_count);
++	return written_count;
++}
+diff --git a/fs/misc.c b/fs/misc.c
+new file mode 100644
+index 0000000..73b6df3
+--- /dev/null
++++ b/fs/misc.c
+@@ -0,0 +1,435 @@
++#include <hermit/errno.h>
++#include <hermit/logging.h>
++#include <hermit/string.h>
++
++#include <hermit/ramdisk.h>
++#include <hermit/hfs_struct.h>
++#include "misc.h"
++
++struct free_block* add_free_block(struct free_block *prev, unsigned long long block_index)
++{
++	struct free_block *new = kmalloc(sizeof(struct free_block));
++	if (!new)
++	{
++		LOG_ERROR("add_free_block: new failed\n");
++		return NULL;
++	}
++
++	new->block_index = block_index;
++	new->next_free_block = prev->next_free_block;
++	prev->next_free_block = new;
++
++	return new;
++}
++
++unsigned long long pop_free_block(struct free_block *now)
++{
++        unsigned long long bn = now->next_free_block->block_index;
++        struct free_block *temp = now->next_free_block;
++		now->next_free_block = now->next_free_block->next_free_block;
++	
++		kfree(temp);
++        return bn;
++}
++
++struct free_file_desc_id* add_free_id(struct free_file_desc_id *previous, int id)
++{
++        struct free_file_desc_id *new = (struct free_file_desc_id*) kmalloc(sizeof(struct free_file_desc_id));
++        if (!new)
++		{
++			LOG_ERROR("add_free_id: new failed\n");
++			return NULL;
++		}
++		
++		new->id = id;
++        new->next_free_file_desc_id = previous->next_free_file_desc_id;
++        previous->next_free_file_desc_id = new;
++
++        return new;
++}
++
++int pop_free_id(struct free_file_desc_id *now)
++{
++        int fd = now->next_free_file_desc_id->id;
++        now->next_free_file_desc_id = now->next_free_file_desc_id->next_free_file_desc_id;
++
++        return fd;
++}
++
++unsigned int has_file(struct dir_desc *curr_dir, char *file_name)
++{
++	unsigned int i;
++
++	for(i=0; i < NO_OF_BLOCKS; i++)
++	{
++		if (curr_dir->dir_table[i].status != s_free)
++			if(!(strcmp(curr_dir->dir_table[i].name, file_name)))
++			{
++       			return i;
++    		}
++	}
++
++	return 0;
++}
++
++struct dir_desc* match_curr_dir_names(struct dir_desc *curr_dir, char *dir_name)
++{
++	int i;
++	if (!curr_dir | !dir_name)
++		return NULL;
++	
++	for(i=0; i< NO_OF_BLOCKS; i++)
++	{
++		if (curr_dir->dir_table[i].status != s_free)
++			if(!strcmp(curr_dir->dir_table[i].name, dir_name) && curr_dir->dir_table[i].is_dir)
++			{	
++				return curr_dir->dir_table[i].dir;
++			}
++	}
++	return NULL;
++}
++
++struct dir_desc* fetch_dir(const char *input_path)
++{
++	int i=0, j=0, order=1;
++	char file_name[100] = "";
++	char *path;
++	char path_without_file[100]= "";
++   	char *token;
++	struct dir_desc *curr_dir = &(ramdisk->root);
++	struct dir_desc *child_dir = NULL;
++
++	if (input_path[0] != '/')
++	{
++		path = kmalloc(strlen(input_path) + 1);
++		if (!path)
++		{
++			LOG_ERROR("path creation failed\n");
++			return NULL;
++		}
++		path[0] = '/';	
++		strcpy(path+1, input_path);
++		path[strlen(input_path)+1] = '\0';
++	}
++	else
++	{
++		path = input_path;
++	}
++
++	while(path[i] != '\0')
++	{
++		if(path[i] == '/')
++			j=i+1;
++		i++;
++	}	
++	strcpy(file_name, path+j);
++	if(j)
++	{
++		/* (path+1) because the path always starts  with "/" */
++		strncpy(path_without_file, path+1, j);
++	}
++
++	else goto label;
++	
++	//LOG_INFO("path=%s, file=%s\n", path_without_file, file_name);
++
++	if(!strcmp(path_without_file, "/"))
++	{
++		LOG_ERROR("path_without_file != '/' \n");
++		goto label;
++	}
++ 	
++	/* walk through child dir */
++	while (token = hfs_strtok(path_without_file, order, '/'))
++	{
++      		//LOG_INFO( "token: %s\n", token );
++		child_dir = match_curr_dir_names(curr_dir, token);
++		if(!child_dir)
++			break;
++
++		curr_dir = child_dir;
++		order++;
++   	}	
++
++label:	
++	return curr_dir;
++}
++		
++char *hfs_strcat(char *dest, const char *src)
++{
++    	int i,j;
++	if (!dest | !src)
++		return NULL;
++
++    	for (i = 0; dest[i] != '\0'; i++);
++
++	for (j = 0; src[j] != '\0'; j++)
++        	dest[i+j] = src[j];
++
++    	dest[i+j] = '\0';
++    	return dest;
++}
++
++char* hfs_strrchr(const char *s, int c)
++{
++	char* ret=0;
++	do {
++		if( *s == (char)c )
++			ret=s;
++	} while(*s++);
++	
++	return ret;
++}
++
++char* hfs_strtok(char* s, int order, char delm)
++{
++	int i = 0, k = 0, j = 0;
++	int count = order;
++	char *W;
++	
++	if(!s | s[0] == '\0')
++	    return NULL;
++    
++	W = (char *)kmalloc(sizeof(char)*100);
++	if (!W)
++		return NULL;
++
++	while (s[i] != '\0')
++	{
++		if (s[i] != delm)
++			W[k] = s[i];
++		else
++		{
++			if (count == 1)
++			{
++				break;
++			}
++
++			else
++			{
++				i++;
++				k = 0;
++				count--;
++				continue;
++			}
++		}
++
++		i++;
++		k++;
++	}
++It:
++	W[k] = 0;
++	return W;
++}
++
++unsigned int hfs_get_free_dir_index(struct dir_desc *dir)
++{
++	unsigned int index;
++	struct file_desc *dir_table = dir->dir_table;
++	for (index = 1; index < NO_OF_BLOCKS; index++)
++	{
++		if (dir_table[index].status == s_free)
++			return index;
++	}
++
++	LOG_ERROR("no free dir index, directory is full\n");
++	return 0;
++}
++
++unsigned long long hfs_get_free_fat_index(struct fat_entry *fat)
++{
++	unsigned long long index;
++	for (index = 1; index < NO_OF_BLOCKS; index++)
++	{
++		if (fat[index].valid == 1)
++			return index;
++	}
++	hfs_print_fat();
++	LOG_ERROR("no valid fat index\n");
++	return 0;	
++}
++
++struct file_desc *get_file(int fd)
++{
++	struct file_desc *file = NULL;
++	if (fd < 0)
++	{
++		LOG_ERROR("fd should >0\n");
++		return NULL;
++	}
++
++	file = file_desc_table[fd];
++	if (!file)
++		LOG_ERROR("no file with fd %u\n",fd);
++	return file;
++}
++
++void hfs_print_mode(char *buf, unsigned int is_dir, unsigned int mode)
++{
++	unsigned int other = mode % 10;
++	unsigned int group = (mode % 100 - other) / 10;
++	unsigned int owner = (mode - group - other) / 100;
++	
++	if (is_dir)
++		buf[0] = 'd';
++	else
++		buf[0] = '-';
++
++	if (owner == 7)
++	{
++		buf[1] = 'r';
++		buf[2] = 'w';
++		buf[3] = 'x';
++	} 
++	else if (owner == 6)
++	{
++		buf[1] = 'r';
++		buf[2] = 'w';
++		buf[3] = '-';
++	}
++	else if (owner == 5)
++	{
++		buf[1] = 'r';
++		buf[2] = '-';
++		buf[3] = 'x';
++	}
++	else if (owner == 4)
++	{
++		buf[1] = 'r';
++		buf[2] = '-';
++		buf[3] = '-';
++	}
++	else if (owner == 3)
++	{
++		buf[1] = '-';
++		buf[2] = 'w';
++		buf[3] = 'x';
++	}
++	else if (owner == 2)
++	{
++		buf[1] = '-';
++		buf[2] = 'w';
++		buf[3] = '-';
++	}
++	else if (owner == 1)
++	{
++		buf[1] = '-';
++		buf[2] = '-';
++		buf[3] = 'x';
++	}
++	else
++	{
++		buf[1] = '-';
++		buf[2] = '-';
++		buf[3] = '-';
++	}
++
++	if (group == 7)
++	{
++		buf[4] = 'r';
++		buf[5] = 'w';
++		buf[6] = 'x';
++	} 
++	else if (group == 6)
++	{
++		buf[4] = 'r';
++		buf[5] = 'w';
++		buf[6] = '-';
++	}
++	else if (group == 5)
++	{
++		buf[4] = 'r';
++		buf[5] = '-';
++		buf[6] = 'x';
++	}
++	else if (group == 4)
++	{
++		buf[4] = 'r';
++		buf[5] = '-';
++		buf[6] = '-';
++	}
++	else if (group == 3)
++	{
++		buf[4] = '-';
++		buf[5] = 'w';
++		buf[6] = 'x';
++	}
++	else if (group == 2)
++	{
++		buf[4] = '-';
++		buf[5] = 'w';
++		buf[6] = '-';
++	}
++	else if (group == 1)
++	{
++		buf[4] = '-';
++		buf[5] = '-';
++		buf[6] = 'x';
++	}
++	else
++	{
++		buf[4] = '-';
++		buf[5] = '-';
++		buf[6] = '-';
++	}
++
++	if (other == 7)
++	{
++		buf[7] = 'r';
++		buf[8] = 'w';
++		buf[9] = 'x';
++	} 
++	else if (other == 6)
++	{
++		buf[7] = 'r';
++		buf[8] = 'w';
++		buf[9] = '-';
++	}
++	else if (other == 5)
++	{
++		buf[7] = 'r';
++		buf[8] = '-';
++		buf[9] = 'x';
++	}
++	else if (other == 4)
++	{
++		buf[7] = 'r';
++		buf[8] = '-';
++		buf[9] = '-';
++	}
++	else if (other == 3)
++	{
++		buf[7] = '-';
++		buf[8] = 'w';
++		buf[9] = 'x';
++	}
++	else if (other == 2)
++	{
++		buf[7] = '-';
++		buf[8] = 'w';
++		buf[9] = '-';
++	}
++	else if (other == 1)
++	{
++		buf[7] = '-';
++		buf[8] = '-';
++		buf[9] = 'x';
++	}
++	else
++	{
++		buf[7] = '-';
++		buf[8] = '-';
++		buf[9] = '-';
++	}
++	
++	//LOG_INFO("buf %s.\n",buf);
++	return;
++}
++
++void hfs_print_fat(void)
++{
++	unsigned long long i;
++	for (i = 0; i < NO_OF_BLOCKS; i++)
++		if (ramdisk->fat[i].valid == 0)
++			LOG_INFO("%llu: block_index: %llu, next_index: %llu\n", i, ramdisk->fat[i].block_index, ramdisk->fat[i].next_index);
++}
+diff --git a/fs/misc.h b/fs/misc.h
+new file mode 100644
+index 0000000..3e010dd
+--- /dev/null
++++ b/fs/misc.h
+@@ -0,0 +1,21 @@
++#include <hermit/hfs_struct.h>
++
++extern struct file_desc **file_desc_table;
++extern struct free_file_desc_id *ffdid;
++
++struct free_block* add_free_block(struct free_block *prev, unsigned long long block_index);
++unsigned long long pop_free_block(struct free_block *now);
++struct free_file_desc_id* add_free_id(struct free_file_desc_id *previous, int id);
++int pop_free_id(struct free_file_desc_id *now);
++unsigned int has_file(struct dir_desc *curr_dir, char *file_name);
++struct dir_desc* match_curr_dir_names(struct dir_desc *curr_dir, char *dir_name);
++struct dir_desc* fetch_dir(const char *path);
++char *hfs_strcat(char *dest, const char *src);
++char* hfs_strrchr(const char *s, int c);
++char* hfs_strtok(char* s, int order, char delm);
++unsigned int hfs_get_free_dir_index(struct dir_desc *dir);
++unsigned long long hfs_get_free_fat_index(struct fat_entry *fat);
++struct file_desc *get_file(int fd);
++void hfs_print_mode(char *buf, unsigned int is_dir, unsigned int mode);
++void hfs_print_fat(void);
++char *hfs_ls(const char *path);
+diff --git a/include/hermit/hfs.h b/include/hermit/hfs.h
+new file mode 100644
+index 0000000..8c4a961
+--- /dev/null
++++ b/include/hermit/hfs.h
+@@ -0,0 +1,26 @@
++#ifndef __HFS_H__
++#define __HFS_H__
++
++#include <hermit/stddef.h>
++#include <hermit/hfs_struct.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++int hfs_mkfs(int new);
++int hfs_mkdir(const char *path, unsigned int mode);
++int hfs_rmdir(const char *path);
++int hfs_open(const char *path, unsigned int flags, unsigned int mode);
++int hfs_close(int fd);
++char *hfs_ls(const char *path);
++size_t hfs_read(int fd, void* buffer, size_t count);
++size_t hfs_write(int fd, const void* buffer, size_t count);
++long long hfs_lseek(int fd, long long offset, int whence);
++int hfs_unlink(const char *path);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/include/hermit/hfs_struct.h b/include/hermit/hfs_struct.h
+new file mode 100644
+index 0000000..07e1625
+--- /dev/null
++++ b/include/hermit/hfs_struct.h
+@@ -0,0 +1,89 @@
++#ifndef __HFS_STRUCT_H
++#define __HFS_STRUCT_H
++
++#include<hermit/stdlib.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifndef HERMIT_MEM
++#define HERMIT_MEM 1 //in GB
++#endif
++
++#define BLOCK_SIZE 4096 //in Byte
++#define NO_OF_BLOCKS HERMIT_MEM*1024*1024*1024/BLOCK_SIZE
++
++#define O_RDONLY	0x000
++#define O_WRONLY	0x001
++#define O_RDWR		0x002
++#define O_CREAT		0x040
++#define O_TRUNC  	0x200
++#define O_APPEND	0x400
++
++#define SEEK_SET 0
++#define SEEK_CUR 1
++#define SEEK_END 2
++
++enum file_status {s_free, s_open, s_read, s_write, s_close};
++
++struct file_desc
++{
++	char name[100];
++	unsigned int is_dir;
++	//int id;
++	long long offset;
++	unsigned int size;
++	unsigned int mode;
++	unsigned int flags;
++	unsigned int status; //open, read, write, close
++	struct dir_desc *dir;
++	unsigned long long fat_index;
++};
++
++struct dir_desc 
++{
++	struct file_desc *dir_table; //entry for each table
++	//struct file_desc dir_table[NO_OF_BLOCKS]; //entry for each table
++	unsigned int num_files;
++};
++
++struct fat_entry
++{
++	int valid;
++	unsigned long long block_index;
++	unsigned long long next_index;
++};
++
++
++struct free_file_desc_id
++{
++	int id;
++	struct free_file_desc_id *next_free_file_desc_id;
++};
++
++struct free_block
++{
++	unsigned long long block_index;
++	struct free_block *next_free_block;
++};
++
++struct disk
++{
++	/* root directory */
++	struct dir_desc root;
++	
++	/* File Allocation Table */
++	struct fat_entry *fat;
++	
++	/* Data block */
++	size_t data_block;
++	
++	/* Free block list */
++	struct free_block *free_block_list;
++};
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/include/hermit/ramdisk.h b/include/hermit/ramdisk.h
+new file mode 100644
+index 0000000..4bb9743
+--- /dev/null
++++ b/include/hermit/ramdisk.h
+@@ -0,0 +1,12 @@
++#ifndef __RAMDISK_H__
++#define __RAMDISK_H__
++
++#include <hermit/memory.h>
++#include <hermit/hfs_struct.h>
++
++/* data */
++//extern size_t ramdisk;
++/* metadata */
++extern struct disk *ramdisk;
++
++#endif
+diff --git a/include/hermit/syscall.h b/include/hermit/syscall.h
+index dc78bee..f6e8c2a 100644
+--- a/include/hermit/syscall.h
++++ b/include/hermit/syscall.h
+@@ -92,6 +92,12 @@ int sys_rcce_fini(int session_id);
+ void sys_yield(void);
+ int sys_kill(tid_t dest, int signum);
+ int sys_signal(signal_handler_t handler);
++/* syscall for porting postmart for project1 */
++int sys_mkdir(const char *path, int mode);
++int sys_rmdir(const char *path);
++char *sys_getcwd(char *buf, int max_line);
++char *sys_ls(const char *path);
++int sys_unlink(const char *path);
+ 
+ struct ucontext;
+ typedef struct ucontext ucontext_t;
+diff --git a/kernel/main.c b/kernel/main.c
+index ece3fcb..65dc4ec 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -37,6 +37,10 @@
+ #include <hermit/spinlock.h>
+ #include <hermit/rcce.h>
+ #include <hermit/logging.h>
++#include <hermit/ramdisk.h>
++#include <hermit/hfs.h>
++#include <hermit/hfs_struct.h>
++
+ #include <asm/irq.h>
+ #include <asm/page.h>
+ #include <asm/uart.h>
+@@ -102,8 +106,44 @@ extern uint8_t hcmask[4];
+ islelock_t* rcce_lock = NULL;
+ rcce_mpb_t* rcce_mpb = NULL;
+ 
++//size_t ramdisk = 0;
++struct disk *ramdisk = NULL;
++
+ extern void signal_init();
+ 
++/* size is the requested ramdisk size in bytes */
++size_t init_ramdisk(unsigned long size) {
++	size_t viraddr, phyaddr, bits;
++	uint32_t npages = PAGE_CEIL(size) >> PAGE_BITS;
++	int err;
++	/* Request a VMA in the address space with the correspondign size */
++	viraddr = vma_alloc((npages + 2)*PAGE_SIZE, VMA_READ|VMA_WRITE|VMA_CACHEABLE);
++	if(BUILTIN_EXPECT(!viraddr, 0))
++	{
++		LOG_ERROR("Request a VMA failed\n");
++		return (size_t)NULL;
++	}
++	/* Request physical pages */
++	phyaddr = get_pages(npages);
++	if(BUILTIN_EXPECT(!phyaddr, 0)) {
++		vma_free(viraddr, viraddr + (npages+2)*PAGE_SIZE);
++		LOG_ERROR("Request physical pages failed\n");
++		return (size_t)NULL;
++	}
++	bits = PG_RW | PG_GLOBAL | PG_NX;
++	/* Perform the virtual to physical mapping */
++	err = page_map(viraddr + PAGE_SIZE, phyaddr, npages, bits);
++	if(BUILTIN_EXPECT(err, 0)) {
++		vma_free(viraddr, viraddr + (npages+2)*PAGE_SIZE);
++		put_pages(phyaddr, npages);
++		LOG_ERROR("Virtual to physical mapping failed\n");
++		return (size_t)NULL;
++	}
++	/* Return a pointer to the beginning of the allocated area */
++	LOG_INFO("init_ramdisk done\n");
++	return (size_t) (viraddr + PAGE_SIZE);
++}
++
+ static int hermit_init(void)
+ {
+ 	uint32_t i;
+@@ -370,6 +410,30 @@ static int initd(void* arg)
+ 	// initialize network
+ 	err = init_netifs();
+ 
++
++
++	ramdisk = kmalloc(sizeof(struct disk));
++	if (!ramdisk)
++	{
++		LOG_ERROR("main: ramdisk failed\n");
++		return -ENOMEM;
++	}
++
++	// initialize ramdisk
++	#define RAMDISK_SIZE (1024*1024*1024*HERMIT_MEM)
++	LOG_INFO("HERMIT_MEM: %dGB\n", HERMIT_MEM);
++	LOG_INFO("RAMDISK_SIZE: %llu\n", RAMDISK_SIZE);
++	ramdisk->data_block = init_ramdisk(RAMDISK_SIZE);
++	LOG_INFO("init_ramdisk returns ramdisk->data_block = %x\n",ramdisk->data_block);
++	/* Let’s access all memory in the data_block to see if all goes well */
++	memset(ramdisk->data_block, 0x00, RAMDISK_SIZE);
++
++	if (hfs_mkfs(1)!= 0)
++	{
++		LOG_ERROR("metadata init failed\n");
++		return -ENOMEM;
++	}
++
+ 	if ((err != 0) || !is_proxy())
+ 	{
+ 		char* dummy[] = {"app_name", NULL};
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index d10691d..82291d4 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -37,6 +37,8 @@
+ #include <hermit/memory.h>
+ #include <hermit/signal.h>
+ #include <hermit/logging.h>
++#include <hermit/ramdisk.h>
++#include <hermit/hfs.h>
+ #include <asm/uhyve.h>
+ #include <sys/poll.h>
+ 
+@@ -163,6 +165,12 @@ ssize_t sys_read(int fd, char* buf, size_t len)
+ {
+ 	sys_read_t sysargs = {__NR_read, fd, len};
+ 	ssize_t j, ret;
++	
++	if (fd < 0)
++	{
++		LOG_ERROR("fd < 0\n");
++		return -1;
++	}
+ 
+ 	// do we have an LwIP file descriptor?
+ 	if (fd & LWIP_FD_BIT) {
+@@ -173,36 +181,43 @@ ssize_t sys_read(int fd, char* buf, size_t len)
+ 		return ret;
+ 	}
+ 
+-	if (is_uhyve()) {
+-		uhyve_read_t uhyve_args = {fd, (char*) virt_to_phys((size_t) buf), len, -1};
++	if (fd < 3)
++	{
++		if (is_uhyve()) {
++			uhyve_read_t uhyve_args = {fd, (char*) virt_to_phys((size_t) buf), len, -1};
+ 
+-		uhyve_send(UHYVE_PORT_READ, (unsigned)virt_to_phys((size_t)&uhyve_args));
++			uhyve_send(UHYVE_PORT_READ, (unsigned)virt_to_phys((size_t)&uhyve_args));
+ 
+-		return uhyve_args.ret;
+-	}
++			return uhyve_args.ret;
++		}
+ 
+-	spinlock_irqsave_lock(&lwip_lock);
+-	if (libc_sd < 0) {
+-		spinlock_irqsave_unlock(&lwip_lock);
+-		return -ENOSYS;
+-	}
++		spinlock_irqsave_lock(&lwip_lock);
++		if (libc_sd < 0) {
++			spinlock_irqsave_unlock(&lwip_lock);
++			return -ENOSYS;
++		}
+ 
+-	int s = libc_sd;
+-	socket_send(s, &sysargs, sizeof(sysargs));
++		int s = libc_sd;
++		socket_send(s, &sysargs, sizeof(sysargs));
+ 
+-	socket_recv(s, &j, sizeof(j));
+-	if (j > 0)
+-	{
+-		ret = socket_recv(s, buf, j);
+-		if (ret < 0) {
+-			spinlock_irqsave_unlock(&lwip_lock);
+-			return ret;
++		socket_recv(s, &j, sizeof(j));
++		if (j > 0)
++		{
++			ret = socket_recv(s, buf, j);
++			if (ret < 0) {
++				spinlock_irqsave_unlock(&lwip_lock);
++				return ret;
++			}
+ 		}
+-	}
+ 
+-	spinlock_irqsave_unlock(&lwip_lock);
++		spinlock_irqsave_unlock(&lwip_lock);
+ 
+-	return j;
++		return j;
++	}
++	else
++	{
++		return hfs_read(fd, buf, len);
++	}
+ }
+ 
+ ssize_t readv(int d, const struct iovec *iov, int iovcnt)
+@@ -227,6 +242,12 @@ ssize_t sys_write(int fd, const char* buf, size_t len)
+ 	if (BUILTIN_EXPECT(!buf, 0))
+ 		return -EINVAL;
+ 
++	if (fd < 0)
++	{
++		LOG_ERROR("fd < 0\n");
++		return -1;
++	}
++
+ 	ssize_t i, ret;
+ 	sys_write_t sysargs = {__NR_write, fd, len};
+ 
+@@ -239,48 +260,55 @@ ssize_t sys_write(int fd, const char* buf, size_t len)
+ 		return ret;
+ 	}
+ 
+-	if (is_uhyve()) {
+-		uhyve_write_t uhyve_args = {fd, (const char*) virt_to_phys((size_t) buf), len};
+-
+-		uhyve_send(UHYVE_PORT_WRITE, (unsigned)virt_to_phys((size_t)&uhyve_args));
+-
+-		return uhyve_args.len;
+-	}
+-
+-	spinlock_irqsave_lock(&lwip_lock);
+-	if (libc_sd < 0)
++	if (fd < 3)
+ 	{
+-		spinlock_irqsave_unlock(&lwip_lock);
+-
+-		spinlock_irqsave_lock(&stdio_lock);
+-		for(i=0; i<len; i++)
+-			kputchar(buf[i]);
+-		spinlock_irqsave_unlock(&stdio_lock);
++		if (is_uhyve()) {
++			uhyve_write_t uhyve_args = {fd, (const char*) virt_to_phys((size_t) buf), len};
+ 
+-		return len;
+-	}
++			uhyve_send(UHYVE_PORT_WRITE, (unsigned)virt_to_phys((size_t)&uhyve_args));
+ 
+-	int s = libc_sd;
+-	socket_send(s, &sysargs, sizeof(sysargs));
++			return uhyve_args.len;
++		}
+ 
+-	i=0;
+-	while(i < len)
+-	{
+-		ret = socket_send(s, (char*)buf+i, len-i);
+-		if (ret < 0) {
++		spinlock_irqsave_lock(&lwip_lock);
++		if (libc_sd < 0)
++		{
+ 			spinlock_irqsave_unlock(&lwip_lock);
+-			return ret;
++
++			spinlock_irqsave_lock(&stdio_lock);
++			for(i=0; i<len; i++)
++				kputchar(buf[i]);
++			spinlock_irqsave_unlock(&stdio_lock);
++
++			return len;
+ 		}
+ 
+-		i += ret;
+-	}
++		int s = libc_sd;
++		socket_send(s, &sysargs, sizeof(sysargs));
+ 
+-	if (fd > 2)
+-		i = socket_recv(s, &i, sizeof(i));
++		i=0;
++		while(i < len)
++		{
++			ret = socket_send(s, (char*)buf+i, len-i);
++			if (ret < 0) {
++				spinlock_irqsave_unlock(&lwip_lock);
++				return ret;
++			}
+ 
+-	spinlock_irqsave_unlock(&lwip_lock);
++			i += ret;
++		}
+ 
+-	return i;
++		if (fd > 2)
++			i = socket_recv(s, &i, sizeof(i));
++
++		spinlock_irqsave_unlock(&lwip_lock);
++	
++		return i;
++	}
++	else
++	{
++		return  hfs_write(fd, buf, len);
++	}
+ }
+ 
+ ssize_t writev(int fildes, const struct iovec *iov, int iovcnt)
+@@ -333,63 +361,66 @@ typedef struct {
+ 
+ int sys_open(const char* name, int flags, int mode)
+ {
+-	if (is_uhyve()) {
+-		uhyve_open_t uhyve_open = {(const char*)virt_to_phys((size_t)name), flags, mode, -1};
+-
+-		uhyve_send(UHYVE_PORT_OPEN, (unsigned)virt_to_phys((size_t) &uhyve_open));
++	return hfs_open(name, flags, mode);
++#if 0
++	else
++	{
++		if (is_uhyve()) {
++			uhyve_open_t uhyve_open = {(const char*)virt_to_phys((size_t)name), flags, mode, -1};
+ 
+-		return uhyve_open.ret;
+-	}
++			uhyve_send(UHYVE_PORT_OPEN, (unsigned)virt_to_phys((size_t) &uhyve_open));
+ 
+-	int s, i, ret, sysnr = __NR_open;
+-	size_t len;
++			return uhyve_open.ret;
++		}
+ 
+-	spinlock_irqsave_lock(&lwip_lock);
+-	if (libc_sd < 0) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
++		int s, i, ret, sysnr = __NR_open;
++		size_t len;
+ 
+-	s = libc_sd;
+-	len = strlen(name)+1;
++		spinlock_irqsave_lock(&lwip_lock);
++		if (libc_sd < 0) {
++			ret = -EINVAL;
++			goto out;
++		}
+ 
+-	//i = 0;
+-	//lwip_setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *) &i, sizeof(i));
++		s = libc_sd;
++		len = strlen(name)+1;
+ 
+-	ret = socket_send(s, &sysnr, sizeof(sysnr));
+-	if (ret < 0)
+-		goto out;
++		//i = 0;
++		//lwip_setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *) &i, sizeof(i));
+ 
+-	ret = socket_send(s, &len, sizeof(len));
+-	if (ret < 0)
+-		goto out;
++		ret = socket_send(s, &sysnr, sizeof(sysnr));
++		if (ret < 0)
++			goto out;
+ 
+-	i=0;
+-	while(i<len)
+-	{
+-		ret = socket_send(s, name+i, len-i);
++		ret = socket_send(s, &len, sizeof(len));
+ 		if (ret < 0)
+ 			goto out;
+-		i += ret;
+-	}
+ 
+-	ret = socket_send(s, &flags, sizeof(flags));
+-	if (ret < 0)
+-		goto out;
++		i=0;
++		while(i<len)
++		{
++			ret = socket_send(s, name+i, len-i);
++			if (ret < 0)
++				goto out;
++			i += ret;
++		}
+ 
+-	ret = socket_send(s, &mode, sizeof(mode));
+-	if (ret < 0)
+-		goto out;
++		ret = socket_send(s, &flags, sizeof(flags));
++		if (ret < 0)
++			goto out;
+ 
+-	//i = 1;
+-	//lwip_setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *) &i, sizeof(i));
++		ret = socket_send(s, &mode, sizeof(mode));
++		if (ret < 0)
++			goto out;
+ 
+-	socket_recv(s, &ret, sizeof(ret));
++		//i = 1;
++		//lwip_setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *) &i, sizeof(i));
+ 
++		socket_recv(s, &ret, sizeof(ret));
+ out:
+-	spinlock_irqsave_unlock(&lwip_lock);
+-
+-	return ret;
++		spinlock_irqsave_unlock(&lwip_lock);
++	}
++#endif
+ }
+ 
+ typedef struct {
+@@ -405,41 +436,48 @@ typedef struct {
+ int sys_close(int fd)
+ {
+ 	int ret, s;
+-	sys_close_t sysargs = {__NR_close, fd};
+-
+-	// do we have an LwIP file descriptor?
+-	if (fd & LWIP_FD_BIT) {
+-		ret = lwip_close(fd & ~LWIP_FD_BIT);
+-		if (ret < 0)
+-			return -errno;
++	if (fd < 3)
++	{
++		sys_close_t sysargs = {__NR_close, fd};
++
++		// do we have an LwIP file descriptor?
++		if (fd & LWIP_FD_BIT) {
++			ret = lwip_close(fd & ~LWIP_FD_BIT);
++			if (ret < 0)
++				return -errno;
++	
++			return 0;
++		}
+ 
+-		return 0;
+-	}
++		if (is_uhyve()) {
++			uhyve_close_t uhyve_close = {fd, -1};
+ 
+-	if (is_uhyve()) {
+-		uhyve_close_t uhyve_close = {fd, -1};
++			uhyve_send(UHYVE_PORT_CLOSE, (unsigned)virt_to_phys((size_t) &uhyve_close));
+ 
+-		uhyve_send(UHYVE_PORT_CLOSE, (unsigned)virt_to_phys((size_t) &uhyve_close));
+-
+-		return uhyve_close.ret;
+-	}
++			return uhyve_close.ret;
++		}
+ 
+-	spinlock_irqsave_lock(&lwip_lock);
+-	if (libc_sd < 0) {
+-		ret = 0;
+-		goto out;
+-	}
++		spinlock_irqsave_lock(&lwip_lock);
++		if (libc_sd < 0) {
++			ret = 0;
++			goto out;
++		}
+ 
+-	s = libc_sd;
+-	ret = socket_send(s, &sysargs, sizeof(sysargs));
+-	if (ret != sizeof(sysargs))
+-		goto out;
+-	socket_recv(s, &ret, sizeof(ret));
++		s = libc_sd;
++		ret = socket_send(s, &sysargs, sizeof(sysargs));
++		if (ret != sizeof(sysargs))
++			goto out;
++		socket_recv(s, &ret, sizeof(ret));
+ 
+-out:
+-	spinlock_irqsave_unlock(&lwip_lock);
++	out:
++		spinlock_irqsave_unlock(&lwip_lock);
+ 
+ 	return ret;
++	}
++	else
++	{
++		return hfs_close(fd);
++	}
+ }
+ 
+ int sys_spinlock_init(spinlock_t** lock)
+@@ -586,6 +624,9 @@ typedef struct {
+ 
+ off_t sys_lseek(int fd, off_t offset, int whence)
+ {
++	return hfs_lseek(fd, offset, whence);	
++
++#if 0
+ 	if (is_uhyve()) {
+ 		uhyve_lseek_t uhyve_lseek = { fd, offset, whence };
+ 
+@@ -610,8 +651,8 @@ off_t sys_lseek(int fd, off_t offset, int whence)
+ 	socket_recv(s, &off, sizeof(off));
+ 
+ 	spinlock_irqsave_unlock(&lwip_lock);
+-
+ 	return off;
++#endif
+ }
+ 
+ int sys_rcce_init(int session_id)
+@@ -805,3 +846,31 @@ int sys_signal(signal_handler_t handler)
+ {
+ 	return hermit_signal(handler);
+ }
++
++/* syscall for porting postmark for project1 */
++int sys_mkdir(const char *path, int mode)
++{
++	return hfs_mkdir(path, mode);
++}
++
++int sys_rmdir(const char *path)
++{
++	return hfs_rmdir(path);
++}
++
++char* sys_getcwd(char *buf, int max_line)
++{
++	strcpy(buf, "/");
++
++	return buf;
++}
++
++char* sys_ls(const char *path)
++{
++	return hfs_ls(path);
++}
++
++int sys_unlink(const char *path)
++{
++	return hfs_unlink(path);
++}
+diff --git a/tools/proxy.c b/tools/proxy.c
+index ca5a647..ddbd634 100644
+--- a/tools/proxy.c
++++ b/tools/proxy.c
+@@ -391,6 +391,7 @@ static int qemu_init(char *path)
+ 
+ 		// add flag to start gdbserver on TCP port 1234
+ 		qemu_argv[i] = "-s";
++		qemu_argv[++i] = "-S";
+ 	}
+ 
+ 	str = getenv("HERMIT_CAPTURE_NET");
+@@ -569,7 +570,7 @@ int handle_syscalls(int s)
+ 	int sysnr;
+ 	ssize_t sret;
+ 	size_t j;
+-
++	
+ 	while(1)
+ 	{
+ 		j = 0;
+diff --git a/usr/tests/Makefile b/usr/tests/Makefile
+new file mode 100644
+index 0000000..fe7c1b2
+--- /dev/null
++++ b/usr/tests/Makefile
+@@ -0,0 +1,24 @@
++CC=/opt/hermit/bin/x86_64-hermit-gcc
++SRC_POSTMARK=postmark-1_5.c
++SRC_LATENCY_TEST=latency_test.c
++#SRC=prog.c
++PROG_POSTMARK=postmark
++PROG_LATENCY_TEST=latency_test
++CFLAGS= -g
++LDFALGS=
++PROXY=/opt/hermit/bin/proxy
++MEM=4G
++VERBOSE=0
++DEBUG=0
++
++all: $(PROG)
++	$(CC) $(CFLAGS) $(SRC_POSTMARK) -o $(PROG_POSTMARK) $(LDFLAGS)
++	$(CC) $(CFLAGS) $(SRC_LATENCY_TEST) -o $(PROG_LATENCY_TEST) $(LDFLAGS)
++
++postmark: all
++	HERMIT_MEM=$(MEM) HERMIT_DEBUG=$(DEBUG) HERMIT_VERBOSE=$(VERBOSE) HERMIT_ISLE=qemu HERMIT_KVM=0 $(PROXY) $(PROG_POSTMARK)
++
++latency_test: all
++	HERMIT_MEM=$(MEM) HERMIT_DEBUG=$(DEBUG) HERMIT_VERBOSE=$(VERBOSE) HERMIT_ISLE=qemu HERMIT_KVM=0 $(PROXY) $(PROG_LATENCY_TEST)
++
++
+diff --git a/usr/tests/_blocks b/usr/tests/_blocks
+new file mode 100644
+index 0000000..831737e
+--- /dev/null
++++ b/usr/tests/_blocks
+@@ -0,0 +1,1530 @@
++/*
++Written by Jeffrey Katcher under contract to Network Appliance.
++Copyright (C) 1997-2001
++Network Appliance, Inc.
++
++This code has been successfully compiled and run by Network
++Appliance on various platforms, including Solaris 2 on an Ultra-170,
++and Windows NT on a Compaq ProLiant. However, this PostMark source
++code is distributed under the Artistic License appended to the end
++of this file. As such, no support is provided. However, please report
++any errors to the author, Jeffrey Katcher <katcher@netcom.com>, or to
++Andy Watson <watson@netapp.com>.
++
++Versions:
++1.00 - Original release - 8/17/97
++
++1.01 - Fixed endless loop on EOF, 
++       Divide by zero when file_size_high=file_size_low - 10/29/97
++       (Thanks to Chuck Murnane)
++
++1.1 - Added new commands to distribute work across multiple directories
++      and/or file systems and multiple work subdirectories.
++
++      Changed set location command (+,-) to allow file systems & weights
++      Added set subdirectories command and code to distribute work across
++         multiple subdirectories
++      Added file redirect to show and run commands
++      Improved help system - 4/8/98
++
++1.11 - Fixed unfortunate problem where read_file opens in append mode thus
++       avoiding actual reads.  (Thanks to Kent Peacock)
++
++1.12 - Changed bytes read and written to float.  Hopefully this will avoid
++       overflow when very large file sizes are used.
++
++1.13 - Added terse report option allowing results to be easily included in
++       other things.  (Thanks to Walter Wong) 
++       Also tweaked help code to allow partial matches
++
++1.14 - Automatically stop run if work files are depleted
++
++1.5 - It was pointed out by many (most recently Michael Flaster) that the
++      pseudo-random number generator was more pseudo than random.  After
++      a review of the literature and extensive benchmarking, I've replaced
++      the previous PRNG with the Mersenne Twister.  While an excellent PRNG,
++      it retains much of the performance of the previous implementation. 
++      URL: http://www.math.keio.ac.jp/~matumoto/emt.html
++      Also changed MB definition to 1024KB, tweaked show command
++*/
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <time.h>
++#include <fcntl.h>
++#if 1
++#include <mkdir.h>
++#include <rmdir.h>
++#include <getcwd.h>
++#include <ls.h>
++
++#define O_RDONLY 0x0000
++#define O_WRONLY 0x0001
++#define O_RDWR 	 0x0002
++#define O_CREAT  0x0100
++#define O_TRUNC  0x0800
++#define O_APPEND 0x1000
++#endif
++#ifdef _WIN32
++#include <io.h>
++#include <direct.h>
++
++#define GETWD(x) getcwd(x,MAX_LINE)
++#define MKDIR(x) mkdir(x)
++#define SEPARATOR "\\"
++#else
++
++#define GETWD(x) getcwd(x,MAX_LINE)
++#define MKDIR(x) mkdir(x,0700)
++#define SEPARATOR "/"
++#endif
++
++#define MAX_LINE 255
++#define MAX_FILENAME 80
++
++#define KILOBYTE 1024
++#define MEGABYTE (KILOBYTE*KILOBYTE)
++
++#define PROMPT "pm>"
++
++typedef struct { /* ADT for table of CLI commands */
++   char *name;    /* name of command */
++   int (*func)(); /* pointer to callback function */
++   char *help;    /* descriptive help string */
++} cmd;
++
++extern int cli_set_size();
++extern int cli_set_number();
++extern int cli_set_seed();
++extern int cli_set_transactions();
++extern int cli_set_location();
++extern int cli_set_subdirs();
++extern int cli_set_read();
++extern int cli_set_write();
++extern int cli_set_buffering();
++extern int cli_set_bias_read();
++extern int cli_set_bias_create();
++extern int cli_set_report();
++
++extern int cli_run();
++extern int cli_show();
++extern int cli_help();
++extern int cli_quit();
++
++cmd command_list[]={ /* table of CLI commands */
++   {"set size",cli_set_size,"Sets low and high bounds of files"},
++   {"set number",cli_set_number,"Sets number of simultaneous files"},
++   {"set seed",cli_set_seed,"Sets seed for random number generator"},
++   {"set transactions",cli_set_transactions,"Sets number of transactions"},
++   {"set location",cli_set_location,"Sets location of working files"},
++   {"set subdirectories",cli_set_subdirs,"Sets number of subdirectories"},
++   {"set read",cli_set_read,"Sets read block size"},
++   {"set write",cli_set_write,"Sets write block size"},
++   {"set buffering",cli_set_buffering,"Sets usage of buffered I/O"},
++   {"set bias read",cli_set_bias_read,
++      "Sets the chance of choosing read over append"},
++   {"set bias create",cli_set_bias_create,
++      "Sets the chance of choosing create over delete"},
++   {"set report",cli_set_report,"Choose verbose or terse report format"},
++   {"run",cli_run,"Runs one iteration of benchmark"},
++   {"show",cli_show,"Displays current configuration"},
++   {"help",cli_help,"Prints out available commands"},
++   {"quit",cli_quit,"Exit program"},
++   NULL
++};
++
++extern void verbose_report();
++extern void terse_report();
++void (*reports[])()={verbose_report,terse_report};
++
++/* Counters */
++int files_created;  /* number of files created */
++int files_deleted;  /* number of files deleted */
++int files_read;     /* number of files read */
++int files_appended; /* number of files appended */
++float bytes_written; /* number of bytes written to files */
++float bytes_read;    /* number of bytes read from files */
++
++/* Configurable Parameters */
++int file_size_low=500;
++int file_size_high=10000;       /* file size: fixed or random within range */
++int simultaneous=500;           /* simultaneous files */
++int seed=42;                    /* random number generator seed */
++int transactions=500;           /* number of transactions */
++int subdirectories=0;		/* Number of subdirectories */
++int read_block_size=512;        /* I/O block sizes */
++int write_block_size=512;
++int bias_read=5;                /* chance of picking read over append */
++int bias_create=5;              /* chance of picking create over delete */
++int buffered_io=1;              /* use C library buffered I/O */
++int report=0;                   /* 0=verbose, 1=terse report format */
++
++/* Working Storage */
++char *file_source; /* pointer to buffer of random text */
++
++typedef struct {
++   char name[MAX_FILENAME+1]; /* name of individual file */
++   int size;                  /* current size of file, 0 = unused file slot */
++} file_entry;
++
++file_entry *file_table; /* table of files in use */
++int file_allocated;     /* pointer to last allocated slot in file_table */
++
++typedef struct file_system_struct {
++   file_entry system;
++   struct file_system_struct *next,*prev;
++} file_system; 
++
++file_system *file_systems; /* table of file systems/directories to use */
++int file_system_weight;    /* sum of weights for all file systems */
++int file_system_count;     /* number of configured file systems */
++char **location_index;     /* weighted index of file systems */
++
++char *read_buffer; /* temporary space for reading file data into */
++
++#define RND(x) ((x>0)?(genrand() % (x)):0)
++extern unsigned long genrand();
++extern void sgenrand();
++
++/* converts integer values to byte/kilobyte/megabyte strings */
++char *scale(i)
++int i;
++{
++   static char buffer[MAX_LINE]; /* storage for current conversion */
++
++   if (i/MEGABYTE)
++      sprintf(buffer,"%.2f megabytes",(float)i/MEGABYTE);
++   else
++      if (i/KILOBYTE)
++         sprintf(buffer,"%.2f kilobytes",(float)i/KILOBYTE);
++      else
++         sprintf(buffer,"%d bytes",i);
++
++   return(buffer);
++}
++
++/* converts float values to byte/kilobyte/megabyte strings */
++char *scalef(i)
++float i;
++{
++   static char buffer[MAX_LINE]; /* storage for current conversion */
++
++   if (i/(float)MEGABYTE>1)
++      sprintf(buffer,"%.2f megabytes",i/(float)MEGABYTE);
++   else
++      if (i/(float)KILOBYTE)
++         sprintf(buffer,"%.2f kilobytes",i/(float)KILOBYTE);
++      else
++         sprintf(buffer,"%f bytes",i);
++
++   return(buffer);
++}
++
++/* UI callback for 'set size' command - sets range of file sizes */
++int cli_set_size(param)
++char *param; /* remainder of command line */
++{
++   char *token;
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      {
++      file_size_low=size;
++      if ((token=strchr(param,' ')) && (size=atoi(token))>0 &&
++         size>=file_size_low)
++         file_size_high=size;
++      else
++         file_size_high=file_size_low;
++      }
++   else
++      fprintf(stderr,"Error: no file size low or high bounds specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set number' command - sets number of files to create */
++int cli_set_number(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      simultaneous=size;
++   else
++      fprintf(stderr,"Error: no file number specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set seed' command - initial value for random number gen */
++int cli_set_seed(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      seed=size;
++   else
++      fprintf(stderr,"Error: no random number seed specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set transactions' - configure number of transactions */
++int cli_set_transactions(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      transactions=size;
++   else
++      fprintf(stderr,"Error: no transactions specified\n");
++
++   return(1);
++}
++
++int parse_weight(params)
++char *params;
++{
++   int weight=1;
++   char *split;
++
++   if (split=strrchr(params,' '))
++      {
++      *split='\0';
++      if ((weight=atoi(split+1))<=0)
++         {
++         fprintf(stderr,"Error: ignoring invalid weight '%s'\n",split+1); 
++         weight=1;
++         }
++      }
++
++   return(weight);
++}
++
++void add_location(params,weight)
++char *params;
++int weight;
++{
++   file_system *new_file_system;
++
++   if (new_file_system=(file_system *)calloc(1,sizeof(file_system)))
++      {
++      strcpy(new_file_system->system.name,params);
++      new_file_system->system.size=weight;
++
++      if (file_systems)
++         {
++         new_file_system->prev=file_systems->prev;
++         file_systems->prev->next=new_file_system;
++         file_systems->prev=new_file_system;
++         }
++      else
++         {
++         new_file_system->prev=new_file_system; 
++         file_systems=new_file_system;
++         }
++
++      file_system_weight+=weight;
++      file_system_count++;
++      }
++}
++
++void delete_location(loc_name)
++char *loc_name;
++{
++   file_system *traverse;
++
++   for (traverse=file_systems; traverse; traverse=traverse->next)
++      if (!strcmp(traverse->system.name,loc_name))
++         {
++         file_system_weight-=traverse->system.size;
++         file_system_count--;
++
++         if (file_systems->prev==file_systems)
++            {
++            free(file_systems);
++            file_systems=NULL;
++            }
++         else
++            {
++            if (file_systems->prev==traverse)
++               file_systems->prev=traverse->prev;
++
++            if (traverse==file_systems)
++               file_systems=file_systems->next;
++            else
++               traverse->prev->next=traverse->next;
++
++            if (traverse->next)
++               traverse->next->prev=traverse->prev;
++
++            free(traverse);
++            }
++
++         break;
++         }
++
++   if (!traverse)
++      fprintf(stderr,"Error: cannot find location '%s'\n",loc_name);
++}
++
++void delete_locations()
++{
++   file_system *next;
++
++   while (file_systems)
++      {
++      next=file_systems->next;
++      free(file_systems);
++      file_systems=next;
++      }
++
++   file_system_weight=0;
++   file_system_count=0;
++}
++
++/* UI callback for 'set location' - configure current working directory */
++int cli_set_location(param)
++char *param; /* remainder of command line */
++{
++   if (param)
++      {
++      switch (*param)
++         {
++         case '+': /* add location to list */
++            add_location(param+1,parse_weight(param+1));
++            break;
++
++         case '-': /* remove location from list */
++            delete_location(param+1);
++            break;
++
++         default:
++            delete_locations();
++            add_location(param,parse_weight(param));
++         }
++      }
++   else
++      fprintf(stderr,"Error: no directory name specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set subdirectories' - configure number of subdirectories */
++int cli_set_subdirs(param)
++char *param; /* remainder of command line */
++{
++   int subdirs;
++
++   if (param && (subdirs=atoi(param))>=0)
++      subdirectories=subdirs;
++   else
++      fprintf(stderr,"Error: invalid number of subdirectories specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set read' - configure read block size (integer) */
++int cli_set_read(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      read_block_size=size;
++   else
++      fprintf(stderr,"Error: no block size specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set write' - configure write block size (integer) */
++int cli_set_write(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      write_block_size=size;
++   else
++      fprintf(stderr,"Error: no block size specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set buffering' - sets buffering mode on or off
++   - true = buffered I/O (default), false = raw I/O */
++int cli_set_buffering(param)
++char *param; /* remainder of command line */
++{
++   if (param && (!strcmp(param,"true") || !strcmp(param,"false")))
++      buffered_io=(!strcmp(param,"true"))?1:0;
++   else
++      fprintf(stderr,"Error: no buffering mode (true/false) specified\n");
++      
++   return(1);
++}
++
++/* UI callback for 'set bias read' - sets probability of read vs. append */
++int cli_set_bias_read(param)
++char *param; /* remainder of command line */
++{
++   int value;
++
++   if (param && (value=atoi(param))>=-1  && value<=10)
++      bias_read=value;
++   else
++      fprintf(stderr,
++        "Error: no bias specified (0-10 for greater chance,-1 to disable)\n");
++
++   return(1);
++}
++
++/* UI callback for 'set bias create' - sets probability of create vs. delete */
++int cli_set_bias_create(param)
++char *param; /* remainder of command line */
++{
++   int value;
++
++   if (param && (value=atoi(param))>=-1  && value<=10)
++      bias_create=value;
++   else
++      fprintf(stderr,
++         "Error: no bias specified (0-10 for greater chance,-1 to disable)\n");
++
++   return(1);
++}
++
++/* UI callback for 'set report' - chooses verbose or terse report formats */
++int cli_set_report(param)
++char *param; /* remainder of command line */
++{
++   int match=0;
++
++   if (param)
++      { 
++      if (!strcmp(param,"verbose"))
++         report=0;
++      else
++         if (!strcmp(param,"terse"))
++            report=1;
++         else
++            match=-1;
++      }
++
++   if (!param || match==-1)
++      fprintf(stderr,"Error: either 'verbose' or 'terse' required\n");
++
++   return(1);
++}
++
++/* populate file source buffer with 'size' bytes of readable randomness */
++char *initialize_file_source(size)
++int size; /* number of bytes of junk to create */
++{
++   char *new_source;
++   int i;
++
++   if ((new_source=(char *)malloc(size))==NULL) /* allocate buffer */
++      fprintf(stderr,"Error: failed to allocate source file of size %d\n",size);
++   else
++      for (i=0; i<size; i++) /* file buffer with junk */
++         new_source[i]=32+RND(95);
++
++   return(new_source);
++}
++
++/* returns differences in times -
++   1 second is the minimum to avoid divide by zero errors */
++time_t diff_time(t1,t0)
++time_t t1;
++time_t t0;
++{
++   return((t1-=t0)?t1:1);
++}
++
++/* prints out results from running transactions */
++void verbose_report(fp,end_time,start_time,t_end_time,t_start_time,deleted)
++FILE *fp;
++time_t end_time,start_time,t_end_time,t_start_time; /* timers from run */
++int deleted; /* files deleted back-to-back */
++{
++   time_t elapsed,t_elapsed;
++   int interval;
++
++   elapsed=diff_time(end_time,start_time);
++   t_elapsed=diff_time(t_end_time,t_start_time);
++
++   fprintf(fp,"Time:\n");
++   fprintf(fp,"\t%d seconds total\n",elapsed);
++   fprintf(fp,"\t%d seconds of transactions (%d per second)\n",t_elapsed,
++      transactions/t_elapsed);
++
++   fprintf(fp,"\nFiles:\n");
++   fprintf(fp,"\t%d created (%d per second)\n",files_created,
++      files_created/elapsed);
++
++   interval=diff_time(t_start_time,start_time);
++   fprintf(fp,"\t\tCreation alone: %d files (%d per second)\n",simultaneous,
++      simultaneous/interval);
++   fprintf(fp,"\t\tMixed with transactions: %d files (%d per second)\n",
++      files_created-simultaneous,(files_created-simultaneous)/t_elapsed);
++   fprintf(fp,"\t%d read (%d per second)\n",files_read,files_read/t_elapsed);
++   fprintf(fp,"\t%d appended (%d per second)\n",files_appended,
++      files_appended/t_elapsed);
++   fprintf(fp,"\t%d deleted (%d per second)\n",files_created,
++      files_created/elapsed);
++   
++   interval=diff_time(end_time,t_end_time);
++   fprintf(fp,"\t\tDeletion alone: %d files (%d per second)\n",deleted,
++      deleted/interval);
++   fprintf(fp,"\t\tMixed with transactions: %d files (%d per second)\n",
++      files_deleted-deleted,(files_deleted-deleted)/t_elapsed);
++
++   fprintf(fp,"\nData:\n");
++   fprintf(fp,"\t%s read ",scalef(bytes_read));
++   fprintf(fp,"(%s per second)\n",scalef(bytes_read/(float)elapsed));
++   fprintf(fp,"\t%s written ",scalef(bytes_written));
++   fprintf(fp,"(%s per second)\n",scalef(bytes_written/(float)elapsed));
++}
++
++void terse_report(fp,end_time,start_time,t_end_time,t_start_time,deleted)
++FILE *fp;
++time_t end_time,start_time,t_end_time,t_start_time; /* timers from run */
++int deleted; /* files deleted back-to-back */
++{
++   time_t elapsed,t_elapsed;
++   int interval;
++
++   elapsed=diff_time(end_time,start_time);
++   t_elapsed=diff_time(t_end_time,t_start_time);
++   interval=diff_time(t_start_time,start_time);
++
++   fprintf(fp,"%d %d %.2f ", elapsed, t_elapsed, 
++      (float)transactions/t_elapsed);
++   fprintf(fp, "%.2f %.2f %.2f ", (float)files_created/elapsed, 
++      (float)simultaneous/interval,
++      (float)(files_created-simultaneous)/t_elapsed);
++   fprintf(fp, "%.2f %.2f ", (float)files_read/t_elapsed,
++      (float)files_appended/t_elapsed);
++   fprintf(fp, "%.2f %.2f %.2f ", (float)files_created/elapsed,
++      (float)deleted/interval,
++      (float)(files_deleted-deleted)/t_elapsed);
++   fprintf(fp, "%.2f %.2f\n", (float)bytes_read/elapsed,
++      (float)bytes_written/elapsed);
++}
++
++/* returns file_table entry of unallocated file
++   - if not at end of table, then return next entry
++   - else search table for gaps */
++int find_free_file()
++{
++   int i;
++
++   if (file_allocated<simultaneous<<1 && file_table[file_allocated].size==0)
++      return(file_allocated++);
++   else /* search entire table for holes */
++      for (i=0; i<simultaneous<<1; i++)
++         if (file_table[i].size==0)
++            {
++            file_allocated=i;
++            return(file_allocated++);
++            }
++
++   return(-1); /* return -1 only if no free files found */
++}
++
++/* write 'size' bytes to file 'fd' using unbuffered I/O */
++void write_blocks(fd,size)
++int fd;
++int size;   /* bytes to write to file */
++{
++   int offset=0; /* offset into file */
++   int i;
++
++   /* write even blocks */
++   for (i=size; i>=write_block_size;
++      i-=write_block_size,offset+=write_block_size)
++      write(fd,file_source+offset,write_block_size);
++
++   write(fd,file_source+offset,i); /* write remainder */
++
++   bytes_written+=size; /* update counter */
++}
++
++/* write 'size' bytes to file 'fp' using buffered I/O */
++void fwrite_blocks(fp,size)
++FILE *fp;
++int size;   /* bytes to write to file */
++{
++   int offset=0; /* offset into file */
++   int i;
++
++   /* write even blocks */
++   for (i=size; i>=write_block_size;
++      i-=write_block_size,offset+=write_block_size)
++      fwrite(file_source+offset,write_block_size,1,fp);
++
++   fwrite(file_source+offset,i,1,fp); /* write remainder */
++   
++   bytes_written+=size; /* update counter */
++}
++
++void create_file_name(dest)
++char *dest;
++{
++   char conversion[MAX_LINE+1];
++
++   *dest='\0';
++   if (file_system_count)
++      {
++      strcat(dest,
++         location_index[(file_system_count==1)?0:RND(file_system_weight)]);
++      strcat(dest,SEPARATOR);
++      }
++
++   if (subdirectories>1)
++      {
++      sprintf(conversion,"/s%d%s",RND(subdirectories),SEPARATOR);
++      strcat(dest,conversion);
++      }
++
++   sprintf(conversion,"%d",++files_created);
++   strcat(dest,conversion);
++}
++
++/* creates new file of specified length and fills it with data */
++void create_file(buffered)
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   FILE *fp=NULL;
++   int fd=-1;
++   int free_file; /* file_table slot for new file */
++
++   if ((free_file=find_free_file())!=-1) /* if file space is available */
++      { /* decide on name and initial length */
++      create_file_name(file_table[free_file].name);
++
++      file_table[free_file].size=
++         file_size_low+RND(file_size_high-file_size_low);
++
++      if (buffered)
++         fp=fopen(file_table[free_file].name,"w");
++      else
++         fd=open(file_table[free_file].name,O_RDWR|O_CREAT,0644);
++
++      if (fp || fd!=-1)
++         {
++         if (buffered)
++            {
++            fwrite_blocks(fp,file_table[free_file].size);
++            fclose(fp);
++            }
++         else
++            {
++            write_blocks(fd,file_table[free_file].size);
++            close(fd);
++            }
++         }
++      else
++         fprintf(stderr,"Error: cannot open '%s' for writing\n",
++            file_table[free_file].name);
++      }
++}
++
++/* deletes specified file from disk and file_table */
++void delete_file(number)
++int number;
++{
++   if (file_table[number].size)
++      {
++     if (remove(file_table[number].name))
++		  fprintf(stderr,"Error: Cannot delete '%s'\n",file_table[number].name);
++	 else
++         { /* reset entry in file_table and update counter */
++         file_table[number].size=0;
++         files_deleted++;
++         }
++      }
++}
++
++/* reads entire specified file into temporary buffer */
++void read_file(number,buffered)
++int number;   /* number of file to read (from file_table) */
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   FILE *fp=NULL;
++   int fd=-1;
++   int i;
++
++   if (buffered)
++      fp=fopen(file_table[number].name,"r");
++   else
++      fd=open(file_table[number].name,O_RDONLY,0644);
++
++   if (fp || fd!=-1)
++      { /* read as many blocks as possible then read the remainder */
++      if (buffered)
++         {
++         for (i=file_table[number].size; i>=read_block_size; i-=read_block_size)
++            fread(read_buffer,read_block_size,1,fp);
++
++         fread(read_buffer,i,1,fp);
++
++         fclose(fp);
++         }
++      else
++         {
++         for (i=file_table[number].size; i>=read_block_size; i-=read_block_size)
++            read(fd,read_buffer,read_block_size);
++
++         read(fd,read_buffer,i);
++
++         close(fd);
++         }
++
++      /* increment counters to record transaction */
++      bytes_read+=file_table[number].size;
++      files_read++;
++      }
++   else
++      fprintf(stderr,"Error: cannot open '%s' for reading\n",
++         file_table[number].name);
++}
++
++/* appends random data to a chosen file up to the maximum configured length */
++void append_file(number,buffered)
++int number;   /* number of file (from file_table) to append date to */
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   FILE *fp=NULL;
++   int fd=-1;
++   int block; /* size of data to append */
++
++   if (file_table[number].size<file_size_high)
++      {
++      if (buffered)
++         fp=fopen(file_table[number].name,"a");
++      else
++         fd=open(file_table[number].name,O_RDWR|O_APPEND,0644);
++
++      if ((fp || fd!=-1) && file_table[number].size<file_size_high)
++         {
++         block=RND(file_size_high-file_table[number].size)+1;
++
++         if (buffered)
++            {
++            fwrite_blocks(fp,block);
++            fclose(fp);
++            }
++         else
++            {
++            write_blocks(fd,block);
++            close(fd);
++            }
++
++         file_table[number].size+=block;
++         files_appended++;
++         }
++      else
++         fprintf(stderr,"Error: cannot open '%s' for append\n",
++            file_table[number].name);
++      }
++}
++
++/* finds and returns the offset of a file that is in use from the file_table */
++int find_used_file() /* only called after files are created */
++{
++   int used_file;
++
++   while (file_table[used_file=RND(simultaneous<<1)].size==0)
++      ;
++
++   return(used_file);
++}
++
++/* reset global counters - done before each test run */
++void reset_counters()
++{
++   files_created=0;
++   files_deleted=0;
++   files_read=0;
++   files_appended=0;
++   bytes_written=0;
++   bytes_read=0;
++}
++
++/* perform the configured number of file transactions
++   - a transaction consisted of either a read or append and either a
++     create or delete all chosen at random */
++int run_transactions(buffered)
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   int percent; /* one tenth of the specified transactions */
++   int i;
++
++   percent=transactions/10;
++   for (i=0; i<transactions; i++)
++      {
++      if (files_created==files_deleted)
++         {
++         printf("out of files!\n");
++         printf("For this workload, either increase the number of files or\n");
++         printf("decrease the number of transactions.\n");
++         break;
++         }
++
++      if (bias_read!=-1) /* if read/append not locked out... */
++         {
++         if (RND(10)<bias_read) /* read file */
++            read_file(find_used_file(),buffered);
++         else /* append file */
++            append_file(find_used_file(),buffered);
++         }
++
++      if (bias_create!=-1) /* if create/delete not locked out... */
++         {
++         if (RND(10)<bias_create) /* create file */
++            create_file(buffered);
++         else /* delete file */{}
++            //delete_file(find_used_file());
++         }
++
++      if ((i % percent)==0) /* if another tenth of the work is done...*/
++         {
++         putchar('.'); /* print progress indicator */
++         fflush(stdout);
++         }
++      }
++
++   return(transactions-i);
++}
++
++char **build_location_index(list,weight)
++file_system *list;
++int weight;
++{
++   char **index;
++   int count;
++   int i=0;
++
++   if ((index=(char **)calloc(1,weight*sizeof(char *)))==NULL)
++      fprintf(stderr,"Error: cannot build weighted index of locations\n");
++   else
++      for (; list; list=list->next)
++         for (count=0; count<list->system.size; count++)
++            index[i++]=list->system.name;
++
++   return(index);
++}
++
++void create_subdirectories(dir_list,base_dir,subdirs)
++file_system *dir_list;
++char *base_dir;
++int subdirs;
++{
++   char dir_name[MAX_LINE+1]; /* buffer holding subdirectory names */
++   char save_dir[MAX_LINE+1];
++   int i;
++
++   if (dir_list)
++      {
++      for (; dir_list; dir_list=dir_list->next)
++         create_subdirectories(NULL,dir_list->system.name,subdirs);
++      }
++   else
++      { 
++      if (base_dir)
++         sprintf(save_dir,"%s%s",base_dir,SEPARATOR);
++      else
++         *save_dir='\0';
++
++      for (i=0; i<subdirs; i++)
++         {
++         sprintf(dir_name,"%ss%d",save_dir,i);
++         MKDIR(dir_name); 
++         }
++      }
++}
++
++void delete_subdirectories(dir_list,base_dir,subdirs)
++file_system *dir_list;
++char *base_dir;
++int subdirs;
++{
++   char dir_name[MAX_LINE+1]; /* buffer holding subdirectory names */
++   char save_dir[MAX_LINE+1];
++   int i;
++
++   if (dir_list)
++      {
++      for (; dir_list; dir_list=dir_list->next)
++         delete_subdirectories(NULL,dir_list->system.name,subdirs);
++      }
++   else
++      { 
++      if (base_dir)
++         sprintf(save_dir,"%s%s",base_dir,SEPARATOR);
++      else
++         *save_dir='\0';
++
++      for (i=0; i<subdirs; i++)
++         {
++         sprintf(dir_name,"%ss%d",save_dir,i);
++         rmdir(dir_name); 
++         }
++      }
++}
++
++/* CLI callback for 'run' - benchmark execution loop */
++int cli_run(param) /* none */
++char *param; /* unused */
++{
++   time_t start_time,t_start_time,t_end_time,end_time; /* elapsed timers */
++   int delete_base; /* snapshot of deleted files counter */
++   FILE *fp=NULL; /* file descriptor for directing output */
++   int incomplete;
++   int i; /* generic iterator */
++
++   reset_counters(); /* reset counters before each run */
++
++   sgenrand(seed); /* initialize random number generator */
++
++   /* allocate file space and fill with junk */
++   file_source=initialize_file_source(file_size_high<<1);
++
++   /* allocate read buffer */
++   read_buffer=(char *)malloc(read_block_size);
++
++   /* allocate table of files at 2 x simultaneous files */
++   file_allocated=0;
++   if ((file_table=(file_entry *)calloc(simultaneous<<1,sizeof(file_entry)))==
++      NULL)
++      fprintf(stderr,"Error: Failed to allocate table for %d files\n",
++         simultaneous<<1);
++
++   if (file_system_count>0)
++      location_index=build_location_index(file_systems,file_system_weight);
++
++   /* create subdirectories if necessary */
++   if (subdirectories>1)
++      {
++      printf("Creating subdirectories...");
++      fflush(stdout);
++      create_subdirectories(file_systems,NULL,subdirectories);
++      printf("Done\n");
++      }
++	
++   time(&start_time); /* store start time */
++
++   /* create files in specified directory until simultaneous number */
++   printf("Creating files...");
++   fflush(stdout);
++   		 /* XXX buffered_io? */
++  		 buffered_io = 0;
++   for (i=0; i<simultaneous; i++)
++      create_file(buffered_io);
++	
++   printf("%d\n",simultaneous);
++
++   printf("Done\n");
++		
++   		//printf("%s\n",ls("/"));
++  		//printf("%s\n", ls("/s0/"));
++ 	 	//printf("%s\n", ls("/s1/"));
++ 	 	//printf("%s\n", ls("/s2/"));
++  		//printf("%s\n", ls("/s3/"));
++   
++   printf("Performing transactions");
++   fflush(stdout);
++   time(&t_start_time);
++   incomplete=run_transactions(buffered_io);
++		//printf("%s\n",ls("/"));
++ 	 	//printf("%s\n", ls("/s0/"));
++ 	 	//printf("%s\n", ls("/s1/"));
++ 	 	//printf("%s\n", ls("/s2/"));
++ 	 	//printf("%s\n", ls("/s3/"));
++   time(&t_end_time);
++   
++   if (!incomplete)
++      printf("Done\n");
++
++   /* delete remaining files */
++   printf("Deleting files...");
++   fflush(stdout);
++   delete_base=files_deleted;
++   for (i=0; i<simultaneous<<1; i++)
++      delete_file(i);
++   printf("Done\n");
++
++   /* print end time and difference, transaction numbers */
++   time(&end_time);
++
++   /* delete previously created subdirectories */
++   if (subdirectories>1)
++      {
++      printf("Deleting subdirectories...");
++      fflush(stdout);
++      delete_subdirectories(file_systems,NULL,subdirectories);
++      printf("Done\n");
++      }
++
++   if (location_index)
++      {
++      free(location_index);
++      location_index=NULL;
++      }
++
++   if (param)
++      if ((fp=fopen(param,"a"))==NULL)
++         fprintf(stderr,"Error: Cannot direct output to file '%s'\n",param);
++
++   if (!fp)
++      fp=stdout;
++
++   if (!incomplete)
++      reports[report](fp,end_time,start_time,t_end_time,t_start_time,
++         files_deleted-delete_base);
++
++   if (param && fp!=stdout)
++      fclose(fp);
++
++   /* free resources allocated for this run */
++   free(file_table);
++   free(read_buffer);
++   free(file_source);
++
++   return(1); /* return 1 unless exit requested, then return 0 */
++}
++
++/* CLI callback for 'show' - print values of configuration variables */
++int cli_show(param) 
++char *param; /* optional: name of output file */
++{
++   char current_dir[MAX_LINE+1]; /* buffer containing working directory */
++   file_system *traverse;
++   FILE *fp=NULL; /* file descriptor for directing output */
++
++   if (param)
++      if ((fp=fopen(param,"a"))==NULL)
++         fprintf(stderr,"Error: Cannot direct output to file '%s'\n",param);
++
++   if (!fp)
++      fp=stdout;
++
++   fprintf(fp,"Current configuration is:\n");
++   fprintf(fp,"The base number of files is %d\n",simultaneous);
++   fprintf(fp,"Transactions: %d\n",transactions);
++
++   if (file_size_low!=file_size_high)
++      {
++      fprintf(fp,"Files range between %s ",scale(file_size_low));
++      fprintf(fp,"and %s in size\n",scale(file_size_high));
++      }
++   else
++      fprintf(fp,"Files are %s in size\n",scale(file_size_low));
++
++   fprintf(fp,"Working director%s: %s\n",(file_system_count>1)?"ies":"y",
++      (file_system_count==0)?GETWD(current_dir):"");
++
++   for (traverse=file_systems; traverse; traverse=traverse->next)
++      printf("\t%s (weight=%d)\n",traverse->system.name,traverse->system.size);
++
++   if (subdirectories>0)
++      fprintf(fp,"%d subdirector%s will be used\n",subdirectories,
++         (subdirectories==1)?"y":"ies");
++
++   fprintf(fp,"Block sizes are: read=%s, ",scale(read_block_size));
++   fprintf(fp,"write=%s\n",scale(write_block_size));
++   fprintf(fp,"Biases are: read/append=%d, create/delete=%d\n",bias_read,
++      bias_create);
++   fprintf(fp,"%ssing Unix buffered file I/O\n",buffered_io?"U":"Not u");
++   fprintf(fp,"Random number generator seed is %d\n",seed);
++
++   fprintf(fp,"Report format is %s.\n",report?"terse":"verbose");
++
++   if (param && fp!=stdout)
++      fclose(fp);
++
++   return(1); /* return 1 unless exit requested, then return 0 */
++}
++
++/* CLI callback for 'quit' - returns 0 causing UI to exit */
++int cli_quit(param) /* none */
++char *param; /* unused */
++{
++   return(0); /* return 1 unless exit requested, then return 0 */
++}
++
++/* CLI callback for 'help' - prints help strings from command_list */
++int cli_help(param) 
++char *param; /* optional: specific command to get help for */
++{
++   int n=0; /* number of matching items */
++   int i; /* traversal variable for command table */
++   int len;
++
++   if (param && (len=strlen(param))>0) /* if a command is specified... */
++      for (i=0; command_list[i].name; i++) /* walk command table */
++         if (!strncmp(command_list[i].name,param,len))
++            {
++            printf("%s - %s\n",command_list[i].name,command_list[i].help);
++            n++;
++            }
++
++   if (!param || !n)
++      for (i=0; command_list[i].name; i++) /* traverse command table */
++         printf("%s - %s\n",command_list[i].name,command_list[i].help);
++
++   return(1); /* return 1 unless exit requested, then return 0 */
++}
++
++/* read CLI line from user, translate aliases if any, return fgets status */
++char *cli_read_line(buffer,size)
++char *buffer; /* empty input line */
++int size;
++{
++   char *result;
++
++   printf("%s",PROMPT);                 /* print prompt */
++   fflush(stdout);                      /* force prompt to print */
++   if (result=fgets(buffer,size,stdin)) /* read line safely */
++      {
++      buffer[strlen(buffer)-1]='\0';    /* delete final CR */
++      if (!strcmp(buffer,"?"))           /* translate aliases */
++         strcpy(buffer,"help");
++      if (!strcmp(buffer,"exit"))
++         strcpy(buffer,"quit");
++      }
++
++   return(result);                      /* return success of fgets */
++}
++
++/* parse CLI input line */
++int cli_parse_line(buffer)
++char *buffer; /* line of user input */
++{
++   int result=1; /* default return status */
++   int len; /* length of parsed command */
++   int i; /* traversal variable for command table */
++
++   if (*buffer=='!') /* check for shell escape */
++      system((strlen(buffer)>1)?buffer+1:getenv("SHELL"));
++   else
++      {
++      for (i=0; command_list[i].name; i++) /* walk command table */
++         if (!strncmp(command_list[i].name,buffer,
++            len=strlen(command_list[i].name)))
++            { /* if command matches... */
++            result=(command_list[i].func)
++               (((int)strlen(buffer)>len)?buffer+len+1:NULL);
++            break; /* call function and pass remainder of line as parameter */
++            }
++
++      if (!command_list[i].name) /* if no commands were called... */
++         printf("Eh?\n"); /* tribute to Canadian diction */
++      }
++
++   return(result); /* return 1 unless exit requested, then return 0 */
++}
++
++/* read config file if present and process it line by line
++   - if 'quit' is in file then function returns 0 */
++int read_config_file(filename,buffer)
++char *filename; /* file name of config file */
++char *buffer;   /* temp storage for each line read from file */
++{
++   int result=1; /* default exit value - proceed with UI */
++   FILE *fp;
++
++   if (fp=fopen(filename,"r")) /* open config file */
++      {
++      printf("Reading configuration from file '%s'\n",filename);
++      while (fgets(buffer,MAX_LINE,fp) && result) /* read lines until 'quit' */
++         {
++         buffer[strlen(buffer)-1]='\0'; /* delete final CR */
++         result=cli_parse_line(buffer); /* process line as typed in */
++         }
++
++      fclose(fp);
++      }
++
++   return(result);
++}
++
++/* main function - reads config files then enters get line/parse line loop */
++main(argc,argv)
++int argc;
++char *argv[];
++{
++   char buffer[MAX_LINE+1]; /* storage for input command line */
++
++   printf("PostMark v1.5 : 3/27/01\n");
++   
++   if (read_config_file((argc==2)?argv[1]:".pmrc",buffer))
++      while (cli_read_line(buffer,MAX_LINE) && cli_parse_line(buffer));
++
++   printf("postmark finished\n");
++}
++
++/*
++
++                         The "Artistic License"
++
++                                Preamble
++
++The intent of this document is to state the conditions under which a
++Package may be copied, such that the Copyright Holder maintains some
++semblance of artistic control over the development of the package,
++while giving the users of the package the right to use and distribute
++the Package in a more-or-less customary fashion, plus the right to make
++reasonable modifications.
++
++Definitions:
++
++        "Package" refers to the collection of files distributed by the
++        Copyright Holder, and derivatives of that collection of files
++        created through textual modification.
++
++        "Standard Version" refers to such a Package if it has not been
++        modified, or has been modified in accordance with the wishes
++        of the Copyright Holder as specified below.
++
++        "Copyright Holder" is whoever is named in the copyright or
++        copyrights for the package.
++
++        "You" is you, if you're thinking about copying or distributing
++        this Package.
++
++        "Reasonable copying fee" is whatever you can justify on the
++        basis of media cost, duplication charges, time of people involved,
++        and so on.  (You will not be required to justify it to the
++        Copyright Holder, but only to the computing community at large
++        as a market that must bear the fee.)
++
++        "Freely Available" means that no fee is charged for the item
++        itself, though there may be fees involved in handling the item.
++        It also means that recipients of the item may redistribute it
++        under the same conditions they received it.
++
++1. You may make and give away verbatim copies of the source form of the
++Standard Version of this Package without restriction, provided that you
++duplicate all of the original copyright notices and associated disclaimers.
++
++2. You may apply bug fixes, portability fixes and other modifications
++derived from the Public Domain or from the Copyright Holder.  A Package
++modified in such a way shall still be considered the Standard Version.
++
++3. You may otherwise modify your copy of this Package in any way, provided
++that you insert a prominent notice in each changed file stating how and
++when you changed that file, and provided that you do at least ONE of the
++following:
++
++    a) place your modifications in the Public Domain or otherwise make them
++    Freely Available, such as by posting said modifications to Usenet or
++    an equivalent medium, or placing the modifications on a major archive
++    site such as uunet.uu.net, or by allowing the Copyright Holder to include
++    your modifications in the Standard Version of the Package.
++
++    b) use the modified Package only within your corporation or organization.
++
++    c) rename any non-standard executables so the names do not conflict
++    with standard executables, which must also be provided, and provide
++    a separate manual page for each non-standard executable that clearly
++    documents how it differs from the Standard Version.
++
++    d) make other distribution arrangements with the Copyright Holder.
++
++4. You may distribute the programs of this Package in object code or
++executable form, provided that you do at least ONE of the following:
++
++    a) distribute a Standard Version of the executables and library files,
++    together with instructions (in the manual page or equivalent) on where
++    to get the Standard Version.
++
++    b) accompany the distribution with the machine-readable source of
++    the Package with your modifications.
++
++    c) give non-standard executables non-standard names, and clearly
++    document the differences in manual pages (or equivalent), together
++    with instructions on where to get the Standard Version.
++
++    d) make other distribution arrangements with the Copyright Holder.
++
++5. You may charge a reasonable copying fee for any distribution of this
++Package.  You may charge any fee you choose for support of this
++Package.  You may not charge a fee for this Package itself.  However,
++you may distribute this Package in aggregate with other (possibly
++commercial) programs as part of a larger (possibly commercial) software
++distribution provided that you do not advertise this Package as a
++product of your own.  You may embed this Package's interpreter within
++an executable of yours (by linking); this shall be construed as a mere
++form of aggregation, provided that the complete Standard Version of the
++interpreter is so embedded.
++
++6. The scripts and library files supplied as input to or produced as
++output from the programs of this Package do not automatically fall
++under the copyright of this Package, but belong to whomever generated
++them, and may be sold commercially, and may be aggregated with this
++Package.  If such scripts or library files are aggregated with this
++Package via the so-called "undump" or "unexec" methods of producing a
++binary executable image, then distribution of such an image shall
++neither be construed as a distribution of this Package nor shall it
++fall under the restrictions of Paragraphs 3 and 4, provided that you do
++not represent such an executable image as a Standard Version of this
++Package.
++
++7. C subroutines (or comparably compiled subroutines in other
++languages) supplied by you and linked into this Package in order to
++emulate subroutines and variables of the language defined by this
++Package shall not be considered part of this Package, but are the
++equivalent of input as in Paragraph 6, provided these subroutines do
++not change the language in any way that would cause it to fail the
++regression tests for the language.
++
++8. Aggregation of this Package with a commercial distribution is always
++permitted provided that the use of this Package is embedded; that is,
++when no overt attempt is made to make this Package's interfaces visible
++to the end user of the commercial distribution.  Such use shall not be
++construed as a distribution of this Package.
++
++9. The name of the Copyright Holder may not be used to endorse or promote
++products derived from this software without specific prior written permission.
++
++10. THIS PACKAGE IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR
++IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
++WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
++
++                                The End
++
++*/
++
++
++/* A C-program for MT19937: Integer version (1999/10/28)          */
++/*  genrand() generates one pseudorandom unsigned integer (32bit) */
++/* which is uniformly distributed among 0 to 2^32-1  for each     */
++/* call. sgenrand(seed) sets initial values to the working area   */
++/* of 624 words. Before genrand(), sgenrand(seed) must be         */
++/* called once. (seed is any 32-bit integer.)                     */
++/*   Coded by Takuji Nishimura, considering the suggestions by    */
++/* Topher Cooper and Marc Rieffel in July-Aug. 1997.              */
++
++/* This library is free software; you can redistribute it and/or   */
++/* modify it under the terms of the GNU Library General Public     */
++/* License as published by the Free Software Foundation; either    */
++/* version 2 of the License, or (at your option) any later         */
++/* version.                                                        */
++/* This library is distributed in the hope that it will be useful, */
++/* but WITHOUT ANY WARRANTY; without even the implied warranty of  */
++/* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.            */
++/* See the GNU Library General Public License for more details.    */
++/* You should have received a copy of the GNU Library General      */
++/* Public License along with this library; if not, write to the    */
++/* Free Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA   */ 
++/* 02111-1307  USA                                                 */
++
++/* Copyright (C) 1997, 1999 Makoto Matsumoto and Takuji Nishimura. */
++/* Any feedback is very welcome. For any question, comments,       */
++/* see http://www.math.keio.ac.jp/matumoto/emt.html or email       */
++/* matumoto@math.keio.ac.jp                                        */
++
++/* REFERENCE                                                       */
++/* M. Matsumoto and T. Nishimura,                                  */
++/* "Mersenne Twister: A 623-Dimensionally Equidistributed Uniform  */
++/* Pseudo-Random Number Generator",                                */
++/* ACM Transactions on Modeling and Computer Simulation,           */
++/* Vol. 8, No. 1, January 1998, pp 3--30.                          */
++
++/* Period parameters */  
++#define N 624
++#define M 397
++#define MATRIX_A 0x9908b0df   /* constant vector a */
++#define UPPER_MASK 0x80000000 /* most significant w-r bits */
++#define LOWER_MASK 0x7fffffff /* least significant r bits */
++
++/* Tempering parameters */   
++#define TEMPERING_MASK_B 0x9d2c5680
++#define TEMPERING_MASK_C 0xefc60000
++#define TEMPERING_SHIFT_U(y)  (y >> 11)
++#define TEMPERING_SHIFT_S(y)  (y << 7)
++#define TEMPERING_SHIFT_T(y)  (y << 15)
++#define TEMPERING_SHIFT_L(y)  (y >> 18)
++
++static unsigned long mt[N]; /* the array for the state vector  */
++static int mti=N+1; /* mti==N+1 means mt[N] is not initialized */
++
++/* Initializing the array with a seed */
++void
++sgenrand(seed)
++    unsigned long seed;	
++{
++    int i;
++
++    for (i=0;i<N;i++) {
++         mt[i] = seed & 0xffff0000;
++         seed = 69069 * seed + 1;
++         mt[i] |= (seed & 0xffff0000) >> 16;
++         seed = 69069 * seed + 1;
++    }
++    mti = N;
++}
++
++/* Initialization by "sgenrand()" is an example. Theoretically,      */
++/* there are 2^19937-1 possible states as an intial state.           */
++/* This function allows to choose any of 2^19937-1 ones.             */
++/* Essential bits in "seed_array[]" is following 19937 bits:         */
++/*  (seed_array[0]&UPPER_MASK), seed_array[1], ..., seed_array[N-1]. */
++/* (seed_array[0]&LOWER_MASK) is discarded.                          */ 
++/* Theoretically,                                                    */
++/*  (seed_array[0]&UPPER_MASK), seed_array[1], ..., seed_array[N-1]  */
++/* can take any values except all zeros.                             */
++void
++lsgenrand(seed_array)
++    unsigned long seed_array[]; 
++    /* the length of seed_array[] must be at least N */
++{
++    int i;
++
++    for (i=0;i<N;i++) 
++      mt[i] = seed_array[i];
++    mti=N;
++}
++
++unsigned long 
++genrand()
++{
++    unsigned long y;
++    static unsigned long mag01[2]={0x0, MATRIX_A};
++    /* mag01[x] = x * MATRIX_A  for x=0,1 */
++
++    if (mti >= N) { /* generate N words at one time */
++        int kk;
++
++        if (mti == N+1)   /* if sgenrand() has not been called, */
++            sgenrand(4357); /* a default initial seed is used   */
++
++        for (kk=0;kk<N-M;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        for (;kk<N-1;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        y = (mt[N-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
++        mt[N-1] = mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1];
++
++        mti = 0;
++    }
++  
++    y = mt[mti++];
++    y ^= TEMPERING_SHIFT_U(y);
++    y ^= TEMPERING_SHIFT_S(y) & TEMPERING_MASK_B;
++    y ^= TEMPERING_SHIFT_T(y) & TEMPERING_MASK_C;
++    y ^= TEMPERING_SHIFT_L(y);
++
++    return y; 
++}
+diff --git a/usr/tests/error.txt b/usr/tests/error.txt
+new file mode 100644
+index 0000000..76248b3
+--- /dev/null
++++ b/usr/tests/error.txt
+@@ -0,0 +1,9 @@
++Breakpoint 1, 0x00000000008398f0 in arch_fault_handler ()
++	(gdb) bt
++#0  0x00000000008398f0 in arch_fault_handler ()
++#1  0x00000000008395d6 in irq_handler ()
++#2  0x0000000000ddd274 in delete_subdirectories (dir_list=0x0, 
++		    base_dir=0x1046 <error: Cannot access memory at address 0x1046>, subdirs=128) at postmark-1.5.c:981
++#3  0x0000000102118ca0 in ?? ()
++#4  0x0000000000835ca5 in kernel_space1 ()
++#5  0x0000000000000000 in ?? ()
+diff --git a/usr/tests/hello.c b/usr/tests/hello.c
+index 8d6050c..1801b59 100644
+--- a/usr/tests/hello.c
++++ b/usr/tests/hello.c
+@@ -56,6 +56,7 @@ int main(int argc, char** argv)
+ 	raise(SIGUSR1);
+ 
+ 	file = fopen("/etc/hostname", "r");
++	printf("file:%d\n",file);
+ 	if (file)
+ 	{
+ 		char fname[N] = "";
+diff --git a/usr/tests/latency_test.c b/usr/tests/latency_test.c
+new file mode 100644
+index 0000000..edf9de4
+--- /dev/null
++++ b/usr/tests/latency_test.c
+@@ -0,0 +1,36 @@
++#include <stdlib.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/time.h>
++
++int main(int argc, char** argv)
++{
++	int i, iterations, random;
++	int fd;
++	struct timeval start = { .tv_sec = 0, .tv_usec = 0 };
++	struct timeval end = { .tv_sec = 0, .tv_usec = 0 };	
++
++	printf("Latency Test for \n");
++	scanf("%d", &iterations);
++								
++	fd = open("latency_test.txt", O_CREAT| O_RDWR, 777);
++	if(fd < 0)
++	{
++		printf("Cannot open file\n");
++		return 0;
++	}
++
++	gettimeofday(&start, NULL);
++
++	for(i=0; i<iterations; i++)
++		lseek(fd, 0, SEEK_SET);
++
++	gettimeofday(&end, NULL);
++	
++	close(fd);
++	printf("[ST] Total elapsed time: %lu\n", \
++	(end.tv_sec * 1000000 + end.tv_usec) - (start.tv_sec * 1000000 + start.tv_usec));
++
++	return 0;
++}
+diff --git a/usr/tests/latency_test_linux.c b/usr/tests/latency_test_linux.c
+new file mode 100644
+index 0000000..baa7153
+--- /dev/null
++++ b/usr/tests/latency_test_linux.c
+@@ -0,0 +1,36 @@
++#include <stdlib.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/time.h>
++#include <fcntl.h>
++
++int main(int argc, char** argv)
++{
++	int i, iterations, random;
++	int fd;
++	struct timeval start = { .tv_sec = 0, .tv_usec = 0 };
++	struct timeval end = { .tv_sec = 0, .tv_usec = 0 };	
++
++	printf("Latency Test for \n");
++	scanf("%d", &iterations);
++								
++	fd = open("latency_test.txt", O_CREAT| O_RDWR, 777);
++	if(fd < 0)
++	{
++		printf("Cannot open file\n");
++		return 0;
++	}
++
++	gettimeofday(&start, NULL);
++
++	for(i=0; i<iterations; i++)
++		lseek(fd, 0, SEEK_SET);
++
++	gettimeofday(&end, NULL);
++	
++	close(fd);
++	printf("[ST] Total elapsed time: %lu\n", \
++	(end.tv_sec * 1000000 + end.tv_usec) - (start.tv_sec * 1000000 + start.tv_usec));
++
++	return 0;
++}
+diff --git a/usr/tests/postmark-1_5.c b/usr/tests/postmark-1_5.c
+new file mode 100644
+index 0000000..3d506aa
+--- /dev/null
++++ b/usr/tests/postmark-1_5.c
+@@ -0,0 +1,1501 @@
++/*
++Written by Jeffrey Katcher under contract to Network Appliance.
++Copyright (C) 1997-2001
++Network Appliance, Inc.
++
++This code has been successfully compiled and run by Network
++Appliance on various platforms, including Solaris 2 on an Ultra-170,
++and Windows NT on a Compaq ProLiant. However, this PostMark source
++code is distributed under the Artistic License appended to the end
++of this file. As such, no support is provided. However, please report
++any errors to the author, Jeffrey Katcher <katcher@netcom.com>, or to
++Andy Watson <watson@netapp.com>.
++
++Versions:
++1.00 - Original release - 8/17/97
++
++1.01 - Fixed endless loop on EOF, 
++       Divide by zero when file_size_high=file_size_low - 10/29/97
++       (Thanks to Chuck Murnane)
++
++1.1 - Added new commands to distribute work across multiple directories
++      and/or file systems and multiple work subdirectories.
++
++      Changed set location command (+,-) to allow file systems & weights
++      Added set subdirectories command and code to distribute work across
++         multiple subdirectories
++      Added file redirect to show and run commands
++      Improved help system - 4/8/98
++
++1.11 - Fixed unfortunate problem where read_file opens in append mode thus
++       avoiding actual reads.  (Thanks to Kent Peacock)
++
++1.12 - Changed bytes read and written to float.  Hopefully this will avoid
++       overflow when very large file sizes are used.
++
++1.13 - Added terse report option allowing results to be easily included in
++       other things.  (Thanks to Walter Wong) 
++       Also tweaked help code to allow partial matches
++
++1.14 - Automatically stop run if work files are depleted
++
++1.5 - It was pointed out by many (most recently Michael Flaster) that the
++      pseudo-random number generator was more pseudo than random.  After
++      a review of the literature and extensive benchmarking, I've replaced
++      the previous PRNG with the Mersenne Twister.  While an excellent PRNG,
++      it retains much of the performance of the previous implementation. 
++      URL: http://www.math.keio.ac.jp/~matumoto/emt.html
++      Also changed MB definition to 1024KB, tweaked show command
++*/
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <time.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <mkdir.h>
++
++#ifdef _WIN32
++#include <io.h>
++#include <direct.h>
++
++#define GETWD(x) getcwd(x,MAX_LINE)
++#define MKDIR(x) mkdir(x)
++#define SEPARATOR "\\"
++#else
++
++#define GETWD(x) getcwd(x,MAX_LINE)
++#define MKDIR(x) mkdir(x,0700)
++#define SEPARATOR "/"
++#endif
++
++#define MAX_LINE 255
++#define MAX_FILENAME 80
++
++#define KILOBYTE 1024
++#define MEGABYTE (KILOBYTE*KILOBYTE)
++
++#define PROMPT "pm>"
++
++typedef struct { /* ADT for table of CLI commands */
++   char *name;    /* name of command */
++   int (*func)(); /* pointer to callback function */
++   char *help;    /* descriptive help string */
++} cmd;
++
++extern int cli_set_size();
++extern int cli_set_number();
++extern int cli_set_seed();
++extern int cli_set_transactions();
++extern int cli_set_location();
++extern int cli_set_subdirs();
++extern int cli_set_read();
++extern int cli_set_write();
++extern int cli_set_buffering();
++extern int cli_set_bias_read();
++extern int cli_set_bias_create();
++extern int cli_set_report();
++
++extern int cli_run();
++extern int cli_show();
++extern int cli_help();
++extern int cli_quit();
++
++cmd command_list[]={ /* table of CLI commands */
++   {"set size",cli_set_size,"Sets low and high bounds of files"},
++   {"set number",cli_set_number,"Sets number of simultaneous files"},
++   {"set seed",cli_set_seed,"Sets seed for random number generator"},
++   {"set transactions",cli_set_transactions,"Sets number of transactions"},
++   {"set location",cli_set_location,"Sets location of working files"},
++   {"set subdirectories",cli_set_subdirs,"Sets number of subdirectories"},
++   {"set read",cli_set_read,"Sets read block size"},
++   {"set write",cli_set_write,"Sets write block size"},
++   {"set buffering",cli_set_buffering,"Sets usage of buffered I/O"},
++   {"set bias read",cli_set_bias_read,
++      "Sets the chance of choosing read over append"},
++   {"set bias create",cli_set_bias_create,
++      "Sets the chance of choosing create over delete"},
++   {"set report",cli_set_report,"Choose verbose or terse report format"},
++   {"run",cli_run,"Runs one iteration of benchmark"},
++   {"show",cli_show,"Displays current configuration"},
++   {"help",cli_help,"Prints out available commands"},
++   {"quit",cli_quit,"Exit program"},
++   NULL
++};
++
++extern void verbose_report();
++extern void terse_report();
++void (*reports[])()={verbose_report,terse_report};
++
++/* Counters */
++int files_created;  /* number of files created */
++int files_deleted;  /* number of files deleted */
++int files_read;     /* number of files read */
++int files_appended; /* number of files appended */
++float bytes_written; /* number of bytes written to files */
++float bytes_read;    /* number of bytes read from files */
++
++/* Configurable Parameters */
++int file_size_low=500;
++int file_size_high=10000;       /* file size: fixed or random within range */
++int simultaneous=500;           /* simultaneous files */
++int seed=42;                    /* random number generator seed */
++int transactions=500;           /* number of transactions */
++int subdirectories=0;		/* Number of subdirectories */
++int read_block_size=512;        /* I/O block sizes */
++int write_block_size=512;
++int bias_read=5;                /* chance of picking read over append */
++int bias_create=5;              /* chance of picking create over delete */
++int buffered_io=0;              /* use C library buffered I/O */
++int report=0;                   /* 0=verbose, 1=terse report format */
++
++/* Working Storage */
++char *file_source; /* pointer to buffer of random text */
++
++typedef struct {
++   char name[MAX_FILENAME+1]; /* name of individual file */
++   int size;                  /* current size of file, 0 = unused file slot */
++} file_entry;
++
++file_entry *file_table; /* table of files in use */
++int file_allocated;     /* pointer to last allocated slot in file_table */
++
++typedef struct file_system_struct {
++   file_entry system;
++   struct file_system_struct *next,*prev;
++} file_system; 
++
++file_system *file_systems; /* table of file systems/directories to use */
++int file_system_weight;    /* sum of weights for all file systems */
++int file_system_count;     /* number of configured file systems */
++char **location_index;     /* weighted index of file systems */
++
++char *read_buffer; /* temporary space for reading file data into */
++
++#define RND(x) ((x>0)?(genrand() % (x)):0)
++extern unsigned long genrand();
++extern void sgenrand();
++
++/* converts integer values to byte/kilobyte/megabyte strings */
++char *scale(i)
++int i;
++{
++   static char buffer[MAX_LINE]; /* storage for current conversion */
++
++   if (i/MEGABYTE)
++      sprintf(buffer,"%.2f megabytes",(float)i/MEGABYTE);
++   else
++      if (i/KILOBYTE)
++         sprintf(buffer,"%.2f kilobytes",(float)i/KILOBYTE);
++      else
++         sprintf(buffer,"%d bytes",i);
++
++   return(buffer);
++}
++
++/* converts float values to byte/kilobyte/megabyte strings */
++char *scalef(i)
++float i;
++{
++   static char buffer[MAX_LINE]; /* storage for current conversion */
++
++   if (i/(float)MEGABYTE>1)
++      sprintf(buffer,"%.2f megabytes",i/(float)MEGABYTE);
++   else
++      if (i/(float)KILOBYTE)
++         sprintf(buffer,"%.2f kilobytes",i/(float)KILOBYTE);
++      else
++         sprintf(buffer,"%f bytes",i);
++
++   return(buffer);
++}
++
++/* UI callback for 'set size' command - sets range of file sizes */
++int cli_set_size(param)
++char *param; /* remainder of command line */
++{
++   char *token;
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      {
++      file_size_low=size;
++      if ((token=strchr(param,' ')) && (size=atoi(token))>0 &&
++         size>=file_size_low)
++         file_size_high=size;
++      else
++         file_size_high=file_size_low;
++      }
++   else
++      fprintf(stderr,"Error: no file size low or high bounds specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set number' command - sets number of files to create */
++int cli_set_number(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      simultaneous=size;
++   else
++      fprintf(stderr,"Error: no file number specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set seed' command - initial value for random number gen */
++int cli_set_seed(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      seed=size;
++   else
++      fprintf(stderr,"Error: no random number seed specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set transactions' - configure number of transactions */
++int cli_set_transactions(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      transactions=size;
++   else
++      fprintf(stderr,"Error: no transactions specified\n");
++
++   return(1);
++}
++
++int parse_weight(params)
++char *params;
++{
++   int weight=1;
++   char *split;
++
++   if (split=strrchr(params,' '))
++      {
++      *split='\0';
++      if ((weight=atoi(split+1))<=0)
++         {
++         fprintf(stderr,"Error: ignoring invalid weight '%s'\n",split+1); 
++         weight=1;
++         }
++      }
++
++   return(weight);
++}
++
++void add_location(params,weight)
++char *params;
++int weight;
++{
++   file_system *new_file_system;
++
++   if (new_file_system=(file_system *)calloc(1,sizeof(file_system)))
++      {
++      strcpy(new_file_system->system.name,params);
++      new_file_system->system.size=weight;
++
++      if (file_systems)
++         {
++         new_file_system->prev=file_systems->prev;
++         file_systems->prev->next=new_file_system;
++         file_systems->prev=new_file_system;
++         }
++      else
++         {
++         new_file_system->prev=new_file_system; 
++         file_systems=new_file_system;
++         }
++
++      file_system_weight+=weight;
++      file_system_count++;
++      }
++}
++
++void delete_location(loc_name)
++char *loc_name;
++{
++   file_system *traverse;
++
++   for (traverse=file_systems; traverse; traverse=traverse->next)
++      if (!strcmp(traverse->system.name,loc_name))
++         {
++         file_system_weight-=traverse->system.size;
++         file_system_count--;
++
++         if (file_systems->prev==file_systems)
++            {
++            free(file_systems);
++            file_systems=NULL;
++            }
++         else
++            {
++            if (file_systems->prev==traverse)
++               file_systems->prev=traverse->prev;
++
++            if (traverse==file_systems)
++               file_systems=file_systems->next;
++            else
++               traverse->prev->next=traverse->next;
++
++            if (traverse->next)
++               traverse->next->prev=traverse->prev;
++
++            free(traverse);
++            }
++
++         break;
++         }
++
++   if (!traverse)
++      fprintf(stderr,"Error: cannot find location '%s'\n",loc_name);
++}
++
++void delete_locations()
++{
++   file_system *next;
++
++   while (file_systems)
++      {
++      next=file_systems->next;
++      free(file_systems);
++      file_systems=next;
++      }
++
++   file_system_weight=0;
++   file_system_count=0;
++}
++
++/* UI callback for 'set location' - configure current working directory */
++int cli_set_location(param)
++char *param; /* remainder of command line */
++{
++   if (param)
++      {
++      switch (*param)
++         {
++         case '+': /* add location to list */
++            add_location(param+1,parse_weight(param+1));
++            break;
++
++         case '-': /* remove location from list */
++            delete_location(param+1);
++            break;
++
++         default:
++            delete_locations();
++            add_location(param,parse_weight(param));
++         }
++      }
++   else
++      fprintf(stderr,"Error: no directory name specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set subdirectories' - configure number of subdirectories */
++int cli_set_subdirs(param)
++char *param; /* remainder of command line */
++{
++   int subdirs;
++
++   if (param && (subdirs=atoi(param))>=0)
++      subdirectories=subdirs;
++   else
++      fprintf(stderr,"Error: invalid number of subdirectories specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set read' - configure read block size (integer) */
++int cli_set_read(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      read_block_size=size;
++   else
++      fprintf(stderr,"Error: no block size specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set write' - configure write block size (integer) */
++int cli_set_write(param)
++char *param; /* remainder of command line */
++{
++   int size;
++
++   if (param && (size=atoi(param))>0)
++      write_block_size=size;
++   else
++      fprintf(stderr,"Error: no block size specified\n");
++
++   return(1);
++}
++
++/* UI callback for 'set buffering' - sets buffering mode on or off
++   - true = buffered I/O (default), false = raw I/O */
++int cli_set_buffering(param)
++char *param; /* remainder of command line */
++{
++   if (param && (!strcmp(param,"true") || !strcmp(param,"false")))
++      buffered_io=(!strcmp(param,"true"))?1:0;
++   else
++      fprintf(stderr,"Error: no buffering mode (true/false) specified\n");
++      
++   return(1);
++}
++
++/* UI callback for 'set bias read' - sets probability of read vs. append */
++int cli_set_bias_read(param)
++char *param; /* remainder of command line */
++{
++   int value;
++
++   if (param && (value=atoi(param))>=-1  && value<=10)
++      bias_read=value;
++   else
++      fprintf(stderr,
++        "Error: no bias specified (0-10 for greater chance,-1 to disable)\n");
++
++   return(1);
++}
++
++/* UI callback for 'set bias create' - sets probability of create vs. delete */
++int cli_set_bias_create(param)
++char *param; /* remainder of command line */
++{
++   int value;
++
++   if (param && (value=atoi(param))>=-1  && value<=10)
++      bias_create=value;
++   else
++      fprintf(stderr,
++         "Error: no bias specified (0-10 for greater chance,-1 to disable)\n");
++
++   return(1);
++}
++
++/* UI callback for 'set report' - chooses verbose or terse report formats */
++int cli_set_report(param)
++char *param; /* remainder of command line */
++{
++   int match=0;
++
++   if (param)
++      { 
++      if (!strcmp(param,"verbose"))
++         report=0;
++      else
++         if (!strcmp(param,"terse"))
++            report=1;
++         else
++            match=-1;
++      }
++
++   if (!param || match==-1)
++      fprintf(stderr,"Error: either 'verbose' or 'terse' required\n");
++
++   return(1);
++}
++
++/* populate file source buffer with 'size' bytes of readable randomness */
++char *initialize_file_source(size)
++int size; /* number of bytes of junk to create */
++{
++   char *new_source;
++   int i;
++
++   if ((new_source=(char *)malloc(size))==NULL) /* allocate buffer */
++      fprintf(stderr,"Error: failed to allocate source file of size %d\n",size);
++   else
++      for (i=0; i<size; i++) /* file buffer with junk */
++         new_source[i]=32+RND(95);
++
++   return(new_source);
++}
++
++/* returns differences in times -
++   1 second is the minimum to avoid divide by zero errors */
++time_t diff_time(t1,t0)
++time_t t1;
++time_t t0;
++{
++   return((t1-=t0)?t1:1);
++}
++
++/* prints out results from running transactions */
++void verbose_report(fp,end_time,start_time,t_end_time,t_start_time,deleted)
++FILE *fp;
++time_t end_time,start_time,t_end_time,t_start_time; /* timers from run */
++int deleted; /* files deleted back-to-back */
++{
++   time_t elapsed,t_elapsed;
++   int interval;
++
++   elapsed=diff_time(end_time,start_time);
++   t_elapsed=diff_time(t_end_time,t_start_time);
++
++   fprintf(fp,"Time:\n");
++   fprintf(fp,"\t%d seconds total\n",elapsed);
++   fprintf(fp,"\t%d seconds of transactions (%d per second)\n",t_elapsed,
++      transactions/t_elapsed);
++
++   fprintf(fp,"\nFiles:\n");
++   fprintf(fp,"\t%d created (%d per second)\n",files_created,
++      files_created/elapsed);
++
++   interval=diff_time(t_start_time,start_time);
++   fprintf(fp,"\t\tCreation alone: %d files (%d per second)\n",simultaneous,
++      simultaneous/interval);
++   fprintf(fp,"\t\tMixed with transactions: %d files (%d per second)\n",
++      files_created-simultaneous,(files_created-simultaneous)/t_elapsed);
++   fprintf(fp,"\t%d read (%d per second)\n",files_read,files_read/t_elapsed);
++   fprintf(fp,"\t%d appended (%d per second)\n",files_appended,
++      files_appended/t_elapsed);
++   fprintf(fp,"\t%d deleted (%d per second)\n",files_created,
++      files_created/elapsed);
++   
++   interval=diff_time(end_time,t_end_time);
++   fprintf(fp,"\t\tDeletion alone: %d files (%d per second)\n",deleted,
++      deleted/interval);
++   fprintf(fp,"\t\tMixed with transactions: %d files (%d per second)\n",
++      files_deleted-deleted,(files_deleted-deleted)/t_elapsed);
++
++   fprintf(fp,"\nData:\n");
++   fprintf(fp,"\t%s read ",scalef(bytes_read));
++   fprintf(fp,"(%s per second)\n",scalef(bytes_read/(float)elapsed));
++   fprintf(fp,"\t%s written ",scalef(bytes_written));
++   fprintf(fp,"(%s per second)\n",scalef(bytes_written/(float)elapsed));
++}
++
++void terse_report(fp,end_time,start_time,t_end_time,t_start_time,deleted)
++FILE *fp;
++time_t end_time,start_time,t_end_time,t_start_time; /* timers from run */
++int deleted; /* files deleted back-to-back */
++{
++   time_t elapsed,t_elapsed;
++   int interval;
++
++   elapsed=diff_time(end_time,start_time);
++   t_elapsed=diff_time(t_end_time,t_start_time);
++   interval=diff_time(t_start_time,start_time);
++
++   fprintf(fp,"%d %d %.2f ", elapsed, t_elapsed, 
++      (float)transactions/t_elapsed);
++   fprintf(fp, "%.2f %.2f %.2f ", (float)files_created/elapsed, 
++      (float)simultaneous/interval,
++      (float)(files_created-simultaneous)/t_elapsed);
++   fprintf(fp, "%.2f %.2f ", (float)files_read/t_elapsed,
++      (float)files_appended/t_elapsed);
++   fprintf(fp, "%.2f %.2f %.2f ", (float)files_created/elapsed,
++      (float)deleted/interval,
++      (float)(files_deleted-deleted)/t_elapsed);
++   fprintf(fp, "%.2f %.2f\n", (float)bytes_read/elapsed,
++      (float)bytes_written/elapsed);
++}
++
++/* returns file_table entry of unallocated file
++   - if not at end of table, then return next entry
++   - else search table for gaps */
++int find_free_file()
++{
++   int i;
++
++   if (file_allocated<simultaneous<<1 && file_table[file_allocated].size==0)
++      return(file_allocated++);
++   else /* search entire table for holes */
++      for (i=0; i<simultaneous<<1; i++)
++         if (file_table[i].size==0)
++            {
++            file_allocated=i;
++            return(file_allocated++);
++            }
++
++   return(-1); /* return -1 only if no free files found */
++}
++
++/* write 'size' bytes to file 'fd' using unbuffered I/O */
++void write_blocks(fd,size)
++int fd;
++int size;   /* bytes to write to file */
++{
++   int offset=0; /* offset into file */
++   int i;
++
++   /* write even blocks */
++   for (i=size; i>=write_block_size;
++      i-=write_block_size,offset+=write_block_size)
++      write(fd,file_source+offset,write_block_size);
++
++   write(fd,file_source+offset,i); /* write remainder */
++
++   bytes_written+=size; /* update counter */
++}
++
++/* write 'size' bytes to file 'fp' using buffered I/O */
++void fwrite_blocks(fp,size)
++FILE *fp;
++int size;   /* bytes to write to file */
++{
++   int offset=0; /* offset into file */
++   int i;
++
++   /* write even blocks */
++   for (i=size; i>=write_block_size;
++      i-=write_block_size,offset+=write_block_size)
++      fwrite(file_source+offset,write_block_size,1,fp);
++
++   fwrite(file_source+offset,i,1,fp); /* write remainder */
++   
++   bytes_written+=size; /* update counter */
++}
++
++void create_file_name(dest)
++char *dest;
++{
++   char conversion[MAX_LINE+1];
++
++   *dest='\0';
++   if (file_system_count)
++      {
++      strcat(dest,
++         location_index[(file_system_count==1)?0:RND(file_system_weight)]);
++      strcat(dest,SEPARATOR);
++      }
++
++   if (subdirectories>1)
++      {
++      sprintf(conversion,"s%d%s",RND(subdirectories),SEPARATOR);
++      strcat(dest,conversion);
++      }
++
++   sprintf(conversion,"%d",++files_created);
++   strcat(dest,conversion);
++}
++
++/* creates new file of specified length and fills it with data */
++void create_file(buffered)
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   FILE *fp=NULL;
++   int fd=-1;
++   int free_file; /* file_table slot for new file */
++
++   if ((free_file=find_free_file())!=-1) /* if file space is available */
++      { /* decide on name and initial length */
++      create_file_name(file_table[free_file].name);
++
++      file_table[free_file].size=
++         file_size_low+RND(file_size_high-file_size_low);
++
++      if (buffered)
++         fp=fopen(file_table[free_file].name,"w");
++      else
++         fd=open(file_table[free_file].name,O_RDWR|O_CREAT,0644);
++
++      if (fp || fd!=-1)
++         {
++         if (buffered)
++            {
++            fwrite_blocks(fp,file_table[free_file].size);
++            fclose(fp);
++            }
++         else
++            {
++            write_blocks(fd,file_table[free_file].size);
++            close(fd);
++            }
++         }
++      else
++         fprintf(stderr,"Error: cannot open '%s' for writing\n",
++            file_table[free_file].name);
++      }
++}
++
++/* deletes specified file from disk and file_table */
++void delete_file(number)
++int number;
++{
++   if (file_table[number].size)
++      {
++      if (remove(file_table[number].name))
++         fprintf(stderr,"Error: Cannot delete '%s'\n",file_table[number].name);
++      else
++         { /* reset entry in file_table and update counter */
++         file_table[number].size=0;
++         files_deleted++;
++         }
++      }
++}
++
++/* reads entire specified file into temporary buffer */
++void read_file(number,buffered)
++int number;   /* number of file to read (from file_table) */
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   FILE *fp=NULL;
++   int fd=-1;
++   int i;
++
++   if (buffered)
++      fp=fopen(file_table[number].name,"r");
++   else
++      fd=open(file_table[number].name,O_RDONLY,0644);
++
++   if (fp || fd!=-1)
++      { /* read as many blocks as possible then read the remainder */
++      if (buffered)
++         {
++         for (i=file_table[number].size; i>=read_block_size; i-=read_block_size)
++            fread(read_buffer,read_block_size,1,fp);
++
++         fread(read_buffer,i,1,fp);
++
++         fclose(fp);
++         }
++      else
++         {
++         for (i=file_table[number].size; i>=read_block_size; i-=read_block_size)
++            read(fd,read_buffer,read_block_size);
++
++         read(fd,read_buffer,i);
++
++         close(fd);
++         }
++
++      /* increment counters to record transaction */
++      bytes_read+=file_table[number].size;
++      files_read++;
++      }
++   else
++      fprintf(stderr,"Error: cannot open '%s' for reading\n",
++         file_table[number].name);
++}
++
++/* appends random data to a chosen file up to the maximum configured length */
++void append_file(number,buffered)
++int number;   /* number of file (from file_table) to append date to */
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   FILE *fp=NULL;
++   int fd=-1;
++   int block; /* size of data to append */
++
++   if (file_table[number].size<file_size_high)
++      {
++      if (buffered)
++         fp=fopen(file_table[number].name,"a");
++      else
++         fd=open(file_table[number].name,O_RDWR|O_APPEND,0644);
++
++      if ((fp || fd!=-1) && file_table[number].size<file_size_high)
++         {
++         block=RND(file_size_high-file_table[number].size)+1;
++
++         if (buffered)
++            {
++            fwrite_blocks(fp,block);
++            fclose(fp);
++            }
++         else
++            {
++            write_blocks(fd,block);
++            close(fd);
++            }
++
++         file_table[number].size+=block;
++         files_appended++;
++         }
++      else
++         fprintf(stderr,"Error: cannot open '%s' for append\n",
++            file_table[number].name);
++      }
++}
++
++/* finds and returns the offset of a file that is in use from the file_table */
++int find_used_file() /* only called after files are created */
++{
++   int used_file;
++
++   while (file_table[used_file=RND(simultaneous<<1)].size==0)
++      ;
++
++   return(used_file);
++}
++
++/* reset global counters - done before each test run */
++void reset_counters()
++{
++   files_created=0;
++   files_deleted=0;
++   files_read=0;
++   files_appended=0;
++   bytes_written=0;
++   bytes_read=0;
++}
++
++/* perform the configured number of file transactions
++   - a transaction consisted of either a read or append and either a
++     create or delete all chosen at random */
++int run_transactions(buffered)
++int buffered; /* 1=buffered I/O (default), 0=unbuffered I/O */
++{
++   int percent; /* one tenth of the specified transactions */
++   int i;
++
++   percent=transactions/10;
++   for (i=0; i<transactions; i++)
++      {
++      if (files_created==files_deleted)
++         {
++         printf("out of files!\n");
++         printf("For this workload, either increase the number of files or\n");
++         printf("decrease the number of transactions.\n");
++         break;
++         }
++
++      if (bias_read!=-1) /* if read/append not locked out... */
++         {
++         if (RND(10)<bias_read) /* read file */
++            read_file(find_used_file(),buffered);
++         else /* append file */
++            append_file(find_used_file(),buffered);
++         }
++
++      if (bias_create!=-1) /* if create/delete not locked out... */
++         {
++         if (RND(10)<bias_create) /* create file */
++            create_file(buffered);
++         else /* delete file */
++            delete_file(find_used_file());
++         }
++
++      if ((i % percent)==0) /* if another tenth of the work is done...*/
++         {
++         putchar('.'); /* print progress indicator */
++         fflush(stdout);
++         }
++      }
++
++   return(transactions-i);
++}
++
++char **build_location_index(list,weight)
++file_system *list;
++int weight;
++{
++   char **index;
++   int count;
++   int i=0;
++
++   if ((index=(char **)calloc(1,weight*sizeof(char *)))==NULL)
++      fprintf(stderr,"Error: cannot build weighted index of locations\n");
++   else
++      for (; list; list=list->next)
++         for (count=0; count<list->system.size; count++)
++            index[i++]=list->system.name;
++
++   return(index);
++}
++
++void create_subdirectories(dir_list,base_dir,subdirs)
++file_system *dir_list;
++char *base_dir;
++int subdirs;
++{
++   char dir_name[MAX_LINE+1]; /* buffer holding subdirectory names */
++   char save_dir[MAX_LINE+1];
++   int i;
++
++   if (dir_list)
++      {
++      for (; dir_list; dir_list=dir_list->next)
++         create_subdirectories(NULL,dir_list->system.name,subdirs);
++      }
++   else
++      { 
++      if (base_dir)
++         sprintf(save_dir,"%s%s",base_dir,SEPARATOR);
++      else
++         *save_dir='\0';
++
++      for (i=0; i<subdirs; i++)
++         {
++         sprintf(dir_name,"%ss%d",save_dir,i);
++         MKDIR(dir_name); 
++         }
++      }
++}
++
++void delete_subdirectories(dir_list,base_dir,subdirs)
++file_system *dir_list;
++char *base_dir;
++int subdirs;
++{
++   char dir_name[MAX_LINE+1]; /* buffer holding subdirectory names */
++   char save_dir[MAX_LINE+1];
++   int i;
++
++   if (dir_list)
++      {
++      for (; dir_list; dir_list=dir_list->next)
++         delete_subdirectories(NULL,dir_list->system.name,subdirs);
++      }
++   else
++      { 
++      if (base_dir)
++         sprintf(save_dir,"%s%s",base_dir,SEPARATOR);
++      else
++         *save_dir='\0';
++
++      for (i=0; i<subdirs; i++)
++         {
++         sprintf(dir_name,"%ss%d",save_dir,i);
++         rmdir(dir_name); 
++         }
++      }
++}
++
++/* CLI callback for 'run' - benchmark execution loop */
++int cli_run(param) /* none */
++char *param; /* unused */
++{
++   time_t start_time,t_start_time,t_end_time,end_time; /* elapsed timers */
++   int delete_base; /* snapshot of deleted files counter */
++   FILE *fp=NULL; /* file descriptor for directing output */
++   int incomplete;
++   int i; /* generic iterator */
++
++   reset_counters(); /* reset counters before each run */
++
++   sgenrand(seed); /* initialize random number generator */
++
++   /* allocate file space and fill with junk */
++   file_source=initialize_file_source(file_size_high<<1);
++
++   /* allocate read buffer */
++   read_buffer=(char *)malloc(read_block_size);
++
++   /* allocate table of files at 2 x simultaneous files */
++   file_allocated=0;
++   if ((file_table=(file_entry *)calloc(simultaneous<<1,sizeof(file_entry)))==
++      NULL)
++      fprintf(stderr,"Error: Failed to allocate table for %d files\n",
++         simultaneous<<1);
++
++   if (file_system_count>0)
++      location_index=build_location_index(file_systems,file_system_weight);
++
++   /* create subdirectories if necessary */
++   if (subdirectories>1)
++      {
++      printf("Creating subdirectories...");
++      fflush(stdout);
++      create_subdirectories(file_systems,NULL,subdirectories);
++      printf("Done\n");
++      }
++
++   time(&start_time); /* store start time */
++
++   /* create files in specified directory until simultaneous number */
++   printf("Creating files...");
++   fflush(stdout);
++   for (i=0; i<simultaneous; i++)
++      create_file(buffered_io);
++   printf("Done\n");
++  
++   printf("Performing transactions");
++   fflush(stdout);
++   time(&t_start_time);
++   incomplete=run_transactions(buffered_io);
++   time(&t_end_time);
++   if (!incomplete)
++      printf("Done\n");
++
++   /* delete remaining files */
++   printf("Deleting files...");
++   fflush(stdout);
++   delete_base=files_deleted;
++   for (i=0; i<simultaneous<<1; i++)
++      delete_file(i);
++   printf("Done\n");
++
++   /* print end time and difference, transaction numbers */
++   time(&end_time);
++
++   /* delete previously created subdirectories */
++   if (subdirectories>1)
++      {
++      printf("Deleting subdirectories...");
++      fflush(stdout);
++      delete_subdirectories(file_systems,NULL,subdirectories);
++      printf("Done\n");
++      }
++
++   if (location_index)
++      {
++      free(location_index);
++      location_index=NULL;
++      }
++
++   if (param)
++      if ((fp=fopen(param,"a"))==NULL)
++         fprintf(stderr,"Error: Cannot direct output to file '%s'\n",param);
++
++   if (!fp)
++      fp=stdout;
++
++   if (!incomplete)
++      reports[report](fp,end_time,start_time,t_end_time,t_start_time,
++         files_deleted-delete_base);
++
++   if (param && fp!=stdout)
++      fclose(fp);
++
++   /* free resources allocated for this run */
++   free(file_table);
++   free(read_buffer);
++   free(file_source);
++
++   return(1); /* return 1 unless exit requested, then return 0 */
++}
++
++/* CLI callback for 'show' - print values of configuration variables */
++int cli_show(param) 
++char *param; /* optional: name of output file */
++{
++   char current_dir[MAX_LINE+1]; /* buffer containing working directory */
++   file_system *traverse;
++   FILE *fp=NULL; /* file descriptor for directing output */
++
++   if (param)
++      if ((fp=fopen(param,"a"))==NULL)
++         fprintf(stderr,"Error: Cannot direct output to file '%s'\n",param);
++
++   if (!fp)
++      fp=stdout;
++
++   fprintf(fp,"Current configuration is:\n");
++   fprintf(fp,"The base number of files is %d\n",simultaneous);
++   fprintf(fp,"Transactions: %d\n",transactions);
++
++   if (file_size_low!=file_size_high)
++      {
++      fprintf(fp,"Files range between %s ",scale(file_size_low));
++      fprintf(fp,"and %s in size\n",scale(file_size_high));
++      }
++   else
++      fprintf(fp,"Files are %s in size\n",scale(file_size_low));
++
++   fprintf(fp,"Working director%s: %s\n",(file_system_count>1)?"ies":"y",
++      (file_system_count==0)?GETWD(current_dir):"");
++
++   for (traverse=file_systems; traverse; traverse=traverse->next)
++      printf("\t%s (weight=%d)\n",traverse->system.name,traverse->system.size);
++
++   if (subdirectories>0)
++      fprintf(fp,"%d subdirector%s will be used\n",subdirectories,
++         (subdirectories==1)?"y":"ies");
++
++   fprintf(fp,"Block sizes are: read=%s, ",scale(read_block_size));
++   fprintf(fp,"write=%s\n",scale(write_block_size));
++   fprintf(fp,"Biases are: read/append=%d, create/delete=%d\n",bias_read,
++      bias_create);
++   fprintf(fp,"%ssing Unix buffered file I/O\n",buffered_io?"U":"Not u");
++   fprintf(fp,"Random number generator seed is %d\n",seed);
++
++   fprintf(fp,"Report format is %s.\n",report?"terse":"verbose");
++
++   if (param && fp!=stdout)
++      fclose(fp);
++
++   return(1); /* return 1 unless exit requested, then return 0 */
++}
++
++/* CLI callback for 'quit' - returns 0 causing UI to exit */
++int cli_quit(param) /* none */
++char *param; /* unused */
++{
++   return(0); /* return 1 unless exit requested, then return 0 */
++}
++
++/* CLI callback for 'help' - prints help strings from command_list */
++int cli_help(param) 
++char *param; /* optional: specific command to get help for */
++{
++   int n=0; /* number of matching items */
++   int i; /* traversal variable for command table */
++   int len;
++
++   if (param && (len=strlen(param))>0) /* if a command is specified... */
++      for (i=0; command_list[i].name; i++) /* walk command table */
++         if (!strncmp(command_list[i].name,param,len))
++            {
++            printf("%s - %s\n",command_list[i].name,command_list[i].help);
++            n++;
++            }
++
++   if (!param || !n)
++      for (i=0; command_list[i].name; i++) /* traverse command table */
++         printf("%s - %s\n",command_list[i].name,command_list[i].help);
++
++   return(1); /* return 1 unless exit requested, then return 0 */
++}
++
++/* read CLI line from user, translate aliases if any, return fgets status */
++char *cli_read_line(buffer,size)
++char *buffer; /* empty input line */
++int size;
++{
++   char *result;
++
++   printf("%s",PROMPT);                 /* print prompt */
++   fflush(stdout);                      /* force prompt to print */
++   if (result=fgets(buffer,size,stdin)) /* read line safely */
++      {
++      buffer[strlen(buffer)-1]='\0';    /* delete final CR */
++      if (!strcmp(buffer,"?"))           /* translate aliases */
++         strcpy(buffer,"help");
++      if (!strcmp(buffer,"exit"))
++         strcpy(buffer,"quit");
++      }
++
++   return(result);                      /* return success of fgets */
++}
++
++/* parse CLI input line */
++int cli_parse_line(buffer)
++char *buffer; /* line of user input */
++{
++   int result=1; /* default return status */
++   int len; /* length of parsed command */
++   int i; /* traversal variable for command table */
++
++   if (*buffer=='!') /* check for shell escape */
++      system((strlen(buffer)>1)?buffer+1:getenv("SHELL"));
++   else
++      {
++      for (i=0; command_list[i].name; i++) /* walk command table */
++         if (!strncmp(command_list[i].name,buffer,
++            len=strlen(command_list[i].name)))
++            { /* if command matches... */
++            result=(command_list[i].func)
++               (((int)strlen(buffer)>len)?buffer+len+1:NULL);
++            break; /* call function and pass remainder of line as parameter */
++            }
++
++      if (!command_list[i].name) /* if no commands were called... */
++         printf("Eh?\n"); /* tribute to Canadian diction */
++      }
++
++   return(result); /* return 1 unless exit requested, then return 0 */
++}
++
++/* read config file if present and process it line by line
++   - if 'quit' is in file then function returns 0 */
++int read_config_file(filename,buffer)
++char *filename; /* file name of config file */
++char *buffer;   /* temp storage for each line read from file */
++{
++   int result=1; /* default exit value - proceed with UI */
++   FILE *fp;
++
++   if (fp=fopen(filename,"r")) /* open config file */
++      {
++      printf("Reading configuration from file '%s'\n",filename);
++      while (fgets(buffer,MAX_LINE,fp) && result) /* read lines until 'quit' */
++         {
++         buffer[strlen(buffer)-1]='\0'; /* delete final CR */
++         result=cli_parse_line(buffer); /* process line as typed in */
++         }
++
++      fclose(fp);
++      }
++
++   return(result);
++}
++
++/* main function - reads config files then enters get line/parse line loop */
++int main(argc,argv)
++int argc;
++char *argv[];
++{
++   char buffer[MAX_LINE+1]; /* storage for input command line */
++
++   printf("PostMark v1.5 : 3/27/01\n");
++   if (read_config_file((argc==2)?argv[1]:".pmrc",buffer))
++      while (cli_read_line(buffer,MAX_LINE) && cli_parse_line(buffer))
++         ;
++}
++
++/*
++
++                         The "Artistic License"
++
++                                Preamble
++
++The intent of this document is to state the conditions under which a
++Package may be copied, such that the Copyright Holder maintains some
++semblance of artistic control over the development of the package,
++while giving the users of the package the right to use and distribute
++the Package in a more-or-less customary fashion, plus the right to make
++reasonable modifications.
++
++Definitions:
++
++        "Package" refers to the collection of files distributed by the
++        Copyright Holder, and derivatives of that collection of files
++        created through textual modification.
++
++        "Standard Version" refers to such a Package if it has not been
++        modified, or has been modified in accordance with the wishes
++        of the Copyright Holder as specified below.
++
++        "Copyright Holder" is whoever is named in the copyright or
++        copyrights for the package.
++
++        "You" is you, if you're thinking about copying or distributing
++        this Package.
++
++        "Reasonable copying fee" is whatever you can justify on the
++        basis of media cost, duplication charges, time of people involved,
++        and so on.  (You will not be required to justify it to the
++        Copyright Holder, but only to the computing community at large
++        as a market that must bear the fee.)
++
++        "Freely Available" means that no fee is charged for the item
++        itself, though there may be fees involved in handling the item.
++        It also means that recipients of the item may redistribute it
++        under the same conditions they received it.
++
++1. You may make and give away verbatim copies of the source form of the
++Standard Version of this Package without restriction, provided that you
++duplicate all of the original copyright notices and associated disclaimers.
++
++2. You may apply bug fixes, portability fixes and other modifications
++derived from the Public Domain or from the Copyright Holder.  A Package
++modified in such a way shall still be considered the Standard Version.
++
++3. You may otherwise modify your copy of this Package in any way, provided
++that you insert a prominent notice in each changed file stating how and
++when you changed that file, and provided that you do at least ONE of the
++following:
++
++    a) place your modifications in the Public Domain or otherwise make them
++    Freely Available, such as by posting said modifications to Usenet or
++    an equivalent medium, or placing the modifications on a major archive
++    site such as uunet.uu.net, or by allowing the Copyright Holder to include
++    your modifications in the Standard Version of the Package.
++
++    b) use the modified Package only within your corporation or organization.
++
++    c) rename any non-standard executables so the names do not conflict
++    with standard executables, which must also be provided, and provide
++    a separate manual page for each non-standard executable that clearly
++    documents how it differs from the Standard Version.
++
++    d) make other distribution arrangements with the Copyright Holder.
++
++4. You may distribute the programs of this Package in object code or
++executable form, provided that you do at least ONE of the following:
++
++    a) distribute a Standard Version of the executables and library files,
++    together with instructions (in the manual page or equivalent) on where
++    to get the Standard Version.
++
++    b) accompany the distribution with the machine-readable source of
++    the Package with your modifications.
++
++    c) give non-standard executables non-standard names, and clearly
++    document the differences in manual pages (or equivalent), together
++    with instructions on where to get the Standard Version.
++
++    d) make other distribution arrangements with the Copyright Holder.
++
++5. You may charge a reasonable copying fee for any distribution of this
++Package.  You may charge any fee you choose for support of this
++Package.  You may not charge a fee for this Package itself.  However,
++you may distribute this Package in aggregate with other (possibly
++commercial) programs as part of a larger (possibly commercial) software
++distribution provided that you do not advertise this Package as a
++product of your own.  You may embed this Package's interpreter within
++an executable of yours (by linking); this shall be construed as a mere
++form of aggregation, provided that the complete Standard Version of the
++interpreter is so embedded.
++
++6. The scripts and library files supplied as input to or produced as
++output from the programs of this Package do not automatically fall
++under the copyright of this Package, but belong to whomever generated
++them, and may be sold commercially, and may be aggregated with this
++Package.  If such scripts or library files are aggregated with this
++Package via the so-called "undump" or "unexec" methods of producing a
++binary executable image, then distribution of such an image shall
++neither be construed as a distribution of this Package nor shall it
++fall under the restrictions of Paragraphs 3 and 4, provided that you do
++not represent such an executable image as a Standard Version of this
++Package.
++
++7. C subroutines (or comparably compiled subroutines in other
++languages) supplied by you and linked into this Package in order to
++emulate subroutines and variables of the language defined by this
++Package shall not be considered part of this Package, but are the
++equivalent of input as in Paragraph 6, provided these subroutines do
++not change the language in any way that would cause it to fail the
++regression tests for the language.
++
++8. Aggregation of this Package with a commercial distribution is always
++permitted provided that the use of this Package is embedded; that is,
++when no overt attempt is made to make this Package's interfaces visible
++to the end user of the commercial distribution.  Such use shall not be
++construed as a distribution of this Package.
++
++9. The name of the Copyright Holder may not be used to endorse or promote
++products derived from this software without specific prior written permission.
++
++10. THIS PACKAGE IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR
++IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
++WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
++
++                                The End
++
++*/
++
++
++/* A C-program for MT19937: Integer version (1999/10/28)          */
++/*  genrand() generates one pseudorandom unsigned integer (32bit) */
++/* which is uniformly distributed among 0 to 2^32-1  for each     */
++/* call. sgenrand(seed) sets initial values to the working area   */
++/* of 624 words. Before genrand(), sgenrand(seed) must be         */
++/* called once. (seed is any 32-bit integer.)                     */
++/*   Coded by Takuji Nishimura, considering the suggestions by    */
++/* Topher Cooper and Marc Rieffel in July-Aug. 1997.              */
++
++/* This library is free software; you can redistribute it and/or   */
++/* modify it under the terms of the GNU Library General Public     */
++/* License as published by the Free Software Foundation; either    */
++/* version 2 of the License, or (at your option) any later         */
++/* version.                                                        */
++/* This library is distributed in the hope that it will be useful, */
++/* but WITHOUT ANY WARRANTY; without even the implied warranty of  */
++/* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.            */
++/* See the GNU Library General Public License for more details.    */
++/* You should have received a copy of the GNU Library General      */
++/* Public License along with this library; if not, write to the    */
++/* Free Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA   */ 
++/* 02111-1307  USA                                                 */
++
++/* Copyright (C) 1997, 1999 Makoto Matsumoto and Takuji Nishimura. */
++/* Any feedback is very welcome. For any question, comments,       */
++/* see http://www.math.keio.ac.jp/matumoto/emt.html or email       */
++/* matumoto@math.keio.ac.jp                                        */
++
++/* REFERENCE                                                       */
++/* M. Matsumoto and T. Nishimura,                                  */
++/* "Mersenne Twister: A 623-Dimensionally Equidistributed Uniform  */
++/* Pseudo-Random Number Generator",                                */
++/* ACM Transactions on Modeling and Computer Simulation,           */
++/* Vol. 8, No. 1, January 1998, pp 3--30.                          */
++
++/* Period parameters */  
++#define N 624
++#define M 397
++#define MATRIX_A 0x9908b0df   /* constant vector a */
++#define UPPER_MASK 0x80000000 /* most significant w-r bits */
++#define LOWER_MASK 0x7fffffff /* least significant r bits */
++
++/* Tempering parameters */   
++#define TEMPERING_MASK_B 0x9d2c5680
++#define TEMPERING_MASK_C 0xefc60000
++#define TEMPERING_SHIFT_U(y)  (y >> 11)
++#define TEMPERING_SHIFT_S(y)  (y << 7)
++#define TEMPERING_SHIFT_T(y)  (y << 15)
++#define TEMPERING_SHIFT_L(y)  (y >> 18)
++
++static unsigned long mt[N]; /* the array for the state vector  */
++static int mti=N+1; /* mti==N+1 means mt[N] is not initialized */
++
++/* Initializing the array with a seed */
++void
++sgenrand(seed)
++    unsigned long seed;	
++{
++    int i;
++
++    for (i=0;i<N;i++) {
++         mt[i] = seed & 0xffff0000;
++         seed = 69069 * seed + 1;
++         mt[i] |= (seed & 0xffff0000) >> 16;
++         seed = 69069 * seed + 1;
++    }
++    mti = N;
++}
++
++/* Initialization by "sgenrand()" is an example. Theoretically,      */
++/* there are 2^19937-1 possible states as an intial state.           */
++/* This function allows to choose any of 2^19937-1 ones.             */
++/* Essential bits in "seed_array[]" is following 19937 bits:         */
++/*  (seed_array[0]&UPPER_MASK), seed_array[1], ..., seed_array[N-1]. */
++/* (seed_array[0]&LOWER_MASK) is discarded.                          */ 
++/* Theoretically,                                                    */
++/*  (seed_array[0]&UPPER_MASK), seed_array[1], ..., seed_array[N-1]  */
++/* can take any values except all zeros.                             */
++void
++lsgenrand(seed_array)
++    unsigned long seed_array[]; 
++    /* the length of seed_array[] must be at least N */
++{
++    int i;
++
++    for (i=0;i<N;i++) 
++      mt[i] = seed_array[i];
++    mti=N;
++}
++
++unsigned long 
++genrand()
++{
++    unsigned long y;
++    static unsigned long mag01[2]={0x0, MATRIX_A};
++    /* mag01[x] = x * MATRIX_A  for x=0,1 */
++
++    if (mti >= N) { /* generate N words at one time */
++        int kk;
++
++        if (mti == N+1)   /* if sgenrand() has not been called, */
++            sgenrand(4357); /* a default initial seed is used   */
++
++        for (kk=0;kk<N-M;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        for (;kk<N-1;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        y = (mt[N-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
++        mt[N-1] = mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1];
++
++        mti = 0;
++    }
++  
++    y = mt[mti++];
++    y ^= TEMPERING_SHIFT_U(y);
++    y ^= TEMPERING_SHIFT_S(y) & TEMPERING_MASK_B;
++    y ^= TEMPERING_SHIFT_T(y) & TEMPERING_MASK_C;
++    y ^= TEMPERING_SHIFT_L(y);
++
++    return y; 
++}
+diff --git a/usr/tests/prog.c b/usr/tests/prog.c
+new file mode 100644
+index 0000000..b44bc07
+--- /dev/null
++++ b/usr/tests/prog.c
+@@ -0,0 +1,40 @@
++#include <stdio.h>
++#include <mkdir.h>
++#include <rmdir.h>
++#include <getcwd.h>
++#include <ls.h>
++#include <fcntl.h>
++
++#define SIZE 100
++int main(int argc, char **argv) {
++	int fd1,fd2,fd3,fd4;
++#if 1
++	mkdir("a",777);
++	mkdir("b",777);
++	mkdir("c",777);
++	mkdir("d",777);
++
++	fd1 = open("a/1", O_CREAT, 777);
++	fd2 = open("b/2", O_CREAT, 777);
++	fd3 = open("c/3", O_CREAT, 777);
++	fd4 = open("d/4", O_CREAT, 777);
++	
++	rmdir("b");
++
++	ls("/");
++	ls("/a/");
++	//ls("/b/");
++	ls("/c/");
++	ls("/d/");
++	
++
++#endif	
++#if 0
++	fd1 = open("c", O_CREAT, 777);
++	write(fd1, "11111", 5);
++	printf("%lld\n", lseek(fd1, 100, SEEK_SET));
++	printf("%lld\n", lseek(fd1, 100, SEEK_CUR));
++	printf("%lld\n", lseek(fd1, 100, SEEK_END));
++#endif
++	return 0;
++}

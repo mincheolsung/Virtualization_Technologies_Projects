@@ -1,0 +1,208 @@
+diff --git a/newlib/libc/include/getcwd.h b/newlib/libc/include/getcwd.h
+new file mode 100644
+index 0000000..862da54
+--- /dev/null
++++ b/newlib/libc/include/getcwd.h
+@@ -0,0 +1,6 @@
++#ifndef GETCWD_H
++#define GETCWD_H
++
++char* getcwd(char *buf, int max_line);
++
++#endif
+diff --git a/newlib/libc/include/ls.h b/newlib/libc/include/ls.h
+new file mode 100644
+index 0000000..cd69bd3
+--- /dev/null
++++ b/newlib/libc/include/ls.h
+@@ -0,0 +1,6 @@
++#ifndef LS_H
++#define LS_H
++
++char* ls(const char *path);
++
++#endif
+diff --git a/newlib/libc/include/mkdir.h b/newlib/libc/include/mkdir.h
+new file mode 100644
+index 0000000..791ec34
+--- /dev/null
++++ b/newlib/libc/include/mkdir.h
+@@ -0,0 +1,6 @@
++#ifndef MKDIR_H
++#define MKDIR_H
++
++int mkdir(const char *path, int mode);
++
++#endif
+diff --git a/newlib/libc/include/rmdir.h b/newlib/libc/include/rmdir.h
+new file mode 100644
+index 0000000..5333821
+--- /dev/null
++++ b/newlib/libc/include/rmdir.h
+@@ -0,0 +1,6 @@
++#ifndef RMDIR_H
++#define RMDIR_H
++
++int rmdir(const char *path);
++
++#endif
+diff --git a/newlib/libc/sys/hermit/Makefile.am b/newlib/libc/sys/hermit/Makefile.am
+index 7e50aaf..f9aac15 100644
+--- a/newlib/libc/sys/hermit/Makefile.am
++++ b/newlib/libc/sys/hermit/Makefile.am
+@@ -4,7 +4,7 @@ AM_CCASFLAGS = $(INCLUDES)
+  
+ noinst_LIBRARIES = lib.a
+ 
+-lib_a_SOURCES = errno.c chown.c environ.c execve.c fork.c getpid.c kill.c lseek.c readlink.c stat.c times.c wait.c close.c _exit.c fstat.c gettod.c isatty.c link.c open.c read.c sbrk.c symlink.c unlink.c write.c signal.c
++lib_a_SOURCES = errno.c chown.c environ.c execve.c fork.c getpid.c kill.c lseek.c readlink.c stat.c times.c wait.c close.c _exit.c fstat.c gettod.c isatty.c link.c open.c read.c sbrk.c symlink.c unlink.c write.c signal.c mkdir.c rmdir.c getcwd.c ls.c
+ lib_a_CCASFLAGS = $(AM_CCASFLAGS)
+ lib_a_CFLAGS = $(AM_CFLAGS)
+  
+diff --git a/newlib/libc/sys/hermit/Makefile.in b/newlib/libc/sys/hermit/Makefile.in
+index fbdf17b..6ddcf4c 100644
+--- a/newlib/libc/sys/hermit/Makefile.in
++++ b/newlib/libc/sys/hermit/Makefile.in
+@@ -80,7 +80,9 @@ am_lib_a_OBJECTS = lib_a-errno.$(OBJEXT) lib_a-chown.$(OBJEXT) \
+ 	lib_a-isatty.$(OBJEXT) lib_a-link.$(OBJEXT) \
+ 	lib_a-open.$(OBJEXT) lib_a-read.$(OBJEXT) lib_a-sbrk.$(OBJEXT) \
+ 	lib_a-symlink.$(OBJEXT) lib_a-unlink.$(OBJEXT) \
+-	lib_a-write.$(OBJEXT) lib_a-signal.$(OBJEXT)
++	lib_a-write.$(OBJEXT) lib_a-signal.$(OBJEXT) \
++	lib_a-mkdir.$(OBJEXT) lib_a-rmdir.$(OBJEXT) \
++	lib_a-getcwd.$(OBJEXT) lib_a-ls.$(OBJEXT)
+ lib_a_OBJECTS = $(am_lib_a_OBJECTS)
+ DEFAULT_INCLUDES = -I.@am__isrc@
+ depcomp =
+@@ -204,7 +206,7 @@ AUTOMAKE_OPTIONS = cygnus
+ INCLUDES = $(NEWLIB_CFLAGS) $(CROSS_CFLAGS) $(TARGET_CFLAGS)
+ AM_CCASFLAGS = $(INCLUDES)
+ noinst_LIBRARIES = lib.a
+-lib_a_SOURCES = errno.c chown.c environ.c execve.c fork.c getpid.c kill.c lseek.c readlink.c stat.c times.c wait.c close.c _exit.c fstat.c gettod.c isatty.c link.c open.c read.c sbrk.c symlink.c unlink.c write.c signal.c
++lib_a_SOURCES = errno.c chown.c environ.c execve.c fork.c getpid.c kill.c lseek.c readlink.c stat.c times.c wait.c close.c _exit.c fstat.c gettod.c isatty.c link.c open.c read.c sbrk.c symlink.c unlink.c write.c signal.c mkdir.c rmdir.c getcwd.c ls.c
+ lib_a_CCASFLAGS = $(AM_CCASFLAGS)
+ lib_a_CFLAGS = $(AM_CFLAGS)
+ ACLOCAL_AMFLAGS = -I ../../..
+@@ -417,6 +419,30 @@ lib_a-signal.o: signal.c
+ lib_a-signal.obj: signal.c
+ 	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-signal.obj `if test -f 'signal.c'; then $(CYGPATH_W) 'signal.c'; else $(CYGPATH_W) '$(srcdir)/signal.c'; fi`
+ 
++lib_a-mkdir.o: mkdir.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-mkdir.o `test -f 'mkdir.c' || echo '$(srcdir)/'`mkdir.c
++
++lib_a-mkdir.obj: mkdir.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-mkdir.obj `if test -f 'mkdir.c'; then $(CYGPATH_W) 'mkdir.c'; else $(CYGPATH_W) '$(srcdir)/mkdir.c'; fi`
++
++lib_a-rmdir.o: rmdir.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-rmdir.o `test -f 'rmdir.c' || echo '$(srcdir)/'`rmdir.c
++
++lib_a-rmdir.obj: rmdir.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-rmdir.obj `if test -f 'rmdir.c'; then $(CYGPATH_W) 'rmdir.c'; else $(CYGPATH_W) '$(srcdir)/rmdir.c'; fi`
++
++lib_a-getcwd.o: getcwd.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-getcwd.o `test -f 'getcwd.c' || echo '$(srcdir)/'`getcwd.c
++
++lib_a-getcwd.obj: getcwd.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-getcwd.obj `if test -f 'getcwd.c'; then $(CYGPATH_W) 'getcwd.c'; else $(CYGPATH_W) '$(srcdir)/getcwd.c'; fi`
++
++lib_a-ls.o: ls.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-ls.o `test -f 'ls.c' || echo '$(srcdir)/'`ls.c
++
++lib_a-ls.obj: ls.c
++	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(lib_a_CFLAGS) $(CFLAGS) -c -o lib_a-ls.obj `if test -f 'ls.c'; then $(CYGPATH_W) 'ls.c'; else $(CYGPATH_W) '$(srcdir)/ls.c'; fi`
++
+ ID: $(HEADERS) $(SOURCES) $(LISP) $(TAGS_FILES)
+ 	list='$(SOURCES) $(HEADERS) $(LISP) $(TAGS_FILES)'; \
+ 	unique=`for i in $$list; do \
+diff --git a/newlib/libc/sys/hermit/getcwd.c b/newlib/libc/sys/hermit/getcwd.c
+new file mode 100644
+index 0000000..a8a7b16
+--- /dev/null
++++ b/newlib/libc/sys/hermit/getcwd.c
+@@ -0,0 +1,12 @@
++#include "config.h"
++#include <_ansi.h>
++#include <_syslist.h>
++#include "syscall.h"
++
++char*
++_DEFUN (getcwd, (buf, max_line),
++		char *buf _AND
++		int max_line)
++{
++	return sys_getcwd(buf, max_line);
++}
+diff --git a/newlib/libc/sys/hermit/ls.c b/newlib/libc/sys/hermit/ls.c
+new file mode 100644
+index 0000000..b352774
+--- /dev/null
++++ b/newlib/libc/sys/hermit/ls.c
+@@ -0,0 +1,11 @@
++#include "config.h"
++#include <_ansi.h>
++#include <_syslist.h>
++#include "syscall.h"
++
++char*
++_DEFUN (ls, (path),
++	char *path)
++{
++	return sys_ls(path);
++}
+diff --git a/newlib/libc/sys/hermit/mkdir.c b/newlib/libc/sys/hermit/mkdir.c
+new file mode 100644
+index 0000000..0a6f499
+--- /dev/null
++++ b/newlib/libc/sys/hermit/mkdir.c
+@@ -0,0 +1,12 @@
++#include "config.h"
++#include <_ansi.h>
++#include <_syslist.h>
++#include "syscall.h"
++
++int
++_DEFUN (mkdir, (path, mode),
++		const char *path _AND
++		int mode)
++{
++	return sys_mkdir(path, mode);
++}
+diff --git a/newlib/libc/sys/hermit/rmdir.c b/newlib/libc/sys/hermit/rmdir.c
+new file mode 100644
+index 0000000..24b3bdc
+--- /dev/null
++++ b/newlib/libc/sys/hermit/rmdir.c
+@@ -0,0 +1,11 @@
++#include "config.h"
++#include <_ansi.h>
++#include <_syslist.h>
++#include "syscall.h"
++
++int
++_DEFUN (rmdir, (path),
++		const char *path)
++{
++	return sys_rmdir(path);
++}
+diff --git a/newlib/libc/sys/hermit/unlink.c b/newlib/libc/sys/hermit/unlink.c
+index bc12230..bf1b198 100644
+--- a/newlib/libc/sys/hermit/unlink.c
++++ b/newlib/libc/sys/hermit/unlink.c
+@@ -31,6 +31,7 @@
+ #include <_syslist.h>
+ #include <errno.h>
+ #include "warning.h"
++#include "syscall.h"
+ 
+ int
+ _DEFUN (unlink, (name),
+@@ -44,6 +45,7 @@ _DEFUN (_unlink_r, (ptr, name),
+ 	struct _reent *ptr _AND
+         const char *name)
+ {
+-	ptr->_errno = ENOENT;
+-	return -1;
++	return sys_unlink(name);
++	//ptr->_errno = ENOENT;
++	//return -1;
+ }

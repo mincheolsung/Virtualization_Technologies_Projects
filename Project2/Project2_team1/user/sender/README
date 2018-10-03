@@ -1,0 +1,21 @@
+To build
+$make
+
+To launch chat application
+$sudo ./chat
+
+Send 4KB data
+$sudo ./send_4k (note that receive_4k should be run before this)
+
+Send 2MB data
+$sudo ./send_2m (note that receive_2m should be run before this)
+
+Send 1GB data
+$sudo ./send_1g (note that receive_1g should be run before this)
+
+Argument
+You can pass an argument of character to be sent.
+For example, if you want to send 2MB of characters of 'G',
+$sudo ./send_2m G
+
+If there is no argument passed, it sends 'A' as default.

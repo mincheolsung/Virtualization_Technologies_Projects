@@ -1,0 +1,17 @@
+To build
+$make
+
+To launch chat application
+$sudo ./chat
+
+Receive 4KB data
+$sudo ./receive_4k (note that receive_4k should be run before sned_4k)
+
+Receive 2MB data
+$sudo ./receive_2m (note that receive_2m should be run before send_2m)
+
+Receive 1GB data
+$sudo ./receive_1g (note that receive_1g should be run before send_1g)
+
+Output
+It writes received data on files (output_4k, output_2m, and output_1g)
