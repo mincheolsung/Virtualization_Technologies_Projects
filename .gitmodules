@@ -1,0 +1,3 @@
+[submodule "Project3/VT_Project3_Hermitcore"]
+	path = Project3/VT_Project3_Hermitcore
+	url = git@github.com:mincheolsung/VT_Project3_Hermitcore.git
